@@ -1,0 +1,973 @@
+"""
+RTS-96 (24-bus) reliability with:
+  - 6-state cyber-physical availability model for generators and lines
+  - Truncated contingency enumeration (up to order K)
+  - DC-OPF (linear screening model; placeholder for future AC-OPF)
+  - FULL component-wise Sobol sensitivity:
+      * every generator gets its own 8 transition-rate multipliers
+      * every line gets its own 8 transition-rate multipliers
+      * plus wind_k, wind_mean, load_sigma
+  - Full result saving for later analysis
+
+Dimension
+---------
+32 generators * 8 rates = 256
+38 lines      * 8 rates = 304
+Wind/load                =   3
+Total Sobol dimension    = 563
+
+Important
+---------
+This is extremely expensive. With first-order + total-order Sobol only:
+    total evaluations ~= N * (D + 2) = N * 565
+So even N=2 => 1130 full model evaluations.
+
+Saved outputs
+-------------
+1) sobol_results_full_component.csv
+   - all Sobol sampled inputs (all 563 variables)
+   - derived wind_scale
+   - outputs: LOLP, EENS, enum_mass, tail_mass, n_contingencies
+   - mean generator / line availability
+
+2) component_availability_full_component.csv
+   - per-sample availability for every generator and line
+   - columns: p_up_G1 ... p_up_G32, p_up_L1 ... p_up_L38
+
+3) sobol_indices_summary_full_component.csv
+   - S1 / ST / confidence intervals for LOLP and EENS for every input variable
+
+4) nominal_component_rates_full_component.csv
+   - nominal transition rates for every generator and every line
+
+This model is internally consistent:
+- component outage uncertainty is handled only in the OUTER contingency layer
+- inner Monte Carlo samples only wind and load uncertainty
+"""
+
+import argparse
+import hashlib
+import itertools
+from typing import Dict, List, Tuple
+
+import numpy as np
+import pandas as pd
+from scipy.optimize import linprog
+from scipy.special import gamma
+from scipy.stats import weibull_min
+from SALib.sample import saltelli
+from SALib.analyze import sobol
+
+
+# ==================== Constants ====================
+
+HOURS_PER_YEAR = 8760.0
+BASE_MVA = 100.0
+EPS = 1e-12
+SERVICE_STATES = (0, 1, 3, 5)
+RATE_KEYS = ["lambda_A", "theta", "mu_M", "mu_R", "mu_p", "lambda_f", "lambda_p", "mu"]
+
+
+# ==================== Helper Functions ====================
+
+def rates_from_FOR_MTTR(FOR: float, mttr_h: float) -> Tuple[float, float]:
+    """
+    Convert FOR and MTTR to:
+      lambda = failure rate per hour
+      mu     = repair rate per hour
+    """
+    FOR = np.clip(FOR, 0.0, 0.999999)
+    mu = 1.0 / max(mttr_h, 1e-9)
+    lam = (FOR * mu) / (1.0 - FOR + EPS)
+    return lam, mu
+
+
+def rates_from_lambdaP_duration(lambda_p_per_year: float, dur_h: float) -> Tuple[float, float]:
+    """
+    Convert line permanent outage rate (per year) and repair duration (hours)
+    into:
+      lambda = failure rate per hour
+      mu     = repair rate per hour
+    """
+    lam = lambda_p_per_year / HOURS_PER_YEAR
+    mu = 1.0 / max(dur_h, 1e-9)
+    return lam, mu
+
+
+def weibull_scale_from_mean(mean_speed: float, k: float) -> float:
+    """Compute Weibull scale from mean speed and shape k."""
+    return mean_speed / gamma(1.0 + 1.0 / k)
+
+
+def wind_power_cf(v: float, v_ci: float = 3.0, v_rated: float = 12.0,
+                  v_co: float = 25.0, cubic: bool = True) -> float:
+    """Simple wind power capacity factor."""
+    if v < v_ci or v >= v_co:
+        return 0.0
+    if v >= v_rated:
+        return 1.0
+    x = (v - v_ci) / (v_rated - v_ci)
+    return x**3 if cubic else x
+
+
+def lognormal_multiplier_from_z(z: float, sigma: float) -> float:
+    """Lognormal load multiplier with mean 1."""
+    return float(np.exp(sigma * z - 0.5 * sigma * sigma))
+
+
+def stable_seed(base_seed: int, *parts) -> int:
+    """Stable deterministic seed independent of Python hash randomization."""
+    h = hashlib.sha256(str((base_seed,) + parts).encode("utf-8")).hexdigest()
+    return int(h[:16], 16) % (2**32 - 1)
+
+
+def clamp_prob(x: float) -> float:
+    """Clamp probability-like quantity to (0,1)."""
+    return float(np.clip(x, 1e-6, 1.0 - 1e-6))
+
+
+def clamp_pos(x: float, floor: float = 1e-9) -> float:
+    """Clamp positive quantity away from zero."""
+    return float(max(x, floor))
+
+
+# ==================== System Data ====================
+
+LOAD_DATA = {
+    1: 108, 2: 97, 3: 180, 4: 74, 5: 71, 6: 136, 7: 125, 8: 171, 9: 175, 10: 195,
+    13: 265, 14: 194, 15: 317, 16: 100, 18: 333, 19: 181, 20: 128
+}
+
+GEN_TYPES = {
+    12:  (0.02, 60.0),
+    20:  (0.10, 50.0),
+    50:  (0.01, 20.0),
+    76:  (0.02, 40.0),
+    100: (0.04, 50.0),
+    155: (0.04, 40.0),
+    197: (0.05, 50.0),
+    350: (0.08, 100.0),
+    400: (0.12, 150.0),
+}
+
+GEN_LAYOUT = [
+    (1, 20), (1, 20), (1, 76), (1, 76),
+    (2, 20), (2, 20), (2, 76), (2, 76),
+    (7, 100), (7, 100), (7, 100),
+    (13, 197), (13, 197), (13, 197),
+    (15, 12), (15, 12), (15, 12), (15, 12), (15, 12), (15, 155),
+    (16, 155),
+    (18, 400),
+    (21, 400),
+    (22, 50), (22, 50), (22, 50), (22, 50), (22, 50), (22, 50),
+    (23, 155), (23, 155), (23, 350),
+]
+
+WIND_FARMS = [(4, 80), (5, 80), (8, 80), (9, 80)]
+
+# (from_bus, to_bus, reactance, flow_limit_MW, outage_rate_per_year, duration_h)
+LINE_DATA = [
+    (1, 2, 0.014, 175, 0.24, 16), (1, 3, 0.211, 175, 0.51, 10), (1, 5, 0.085, 175, 0.33, 10),
+    (2, 4, 0.127, 175, 0.39, 10), (2, 6, 0.192, 175, 0.48, 10), (3, 9, 0.119, 175, 0.38, 10),
+    (3, 24, 0.084, 400, 0.02, 768), (4, 9, 0.104, 175, 0.36, 10), (5, 10, 0.088, 175, 0.34, 10),
+    (6, 10, 0.061, 175, 0.33, 35), (7, 8, 0.061, 175, 0.30, 10), (8, 9, 0.165, 175, 0.44, 10),
+    (8, 10, 0.165, 175, 0.44, 10), (9, 11, 0.084, 400, 0.02, 768), (9, 12, 0.084, 400, 0.02, 768),
+    (10, 11, 0.084, 400, 0.02, 768), (10, 12, 0.084, 400, 0.02, 768), (11, 13, 0.048, 500, 0.40, 11),
+    (11, 14, 0.042, 500, 0.39, 11), (12, 13, 0.048, 500, 0.40, 11), (12, 23, 0.097, 500, 0.52, 11),
+    (13, 23, 0.087, 500, 0.49, 11), (14, 16, 0.059, 500, 0.38, 11), (15, 16, 0.017, 500, 0.33, 11),
+    (15, 21, 0.049, 500, 0.41, 11), (15, 21, 0.049, 500, 0.41, 11), (15, 24, 0.052, 500, 0.41, 11),
+    (16, 17, 0.026, 500, 0.35, 11), (16, 19, 0.023, 500, 0.34, 11), (17, 18, 0.014, 500, 0.32, 11),
+    (17, 22, 0.105, 500, 0.54, 11), (18, 21, 0.026, 500, 0.35, 11), (18, 21, 0.026, 500, 0.35, 11),
+    (19, 20, 0.040, 500, 0.38, 11), (19, 20, 0.040, 500, 0.38, 11), (20, 23, 0.022, 500, 0.34, 11),
+    (20, 23, 0.022, 500, 0.34, 11), (21, 22, 0.068, 500, 0.45, 11),
+]
+
+
+# ==================== Build System ====================
+
+def build_system():
+    """
+    Return dictionaries of generators, lines, wind farms, loads with nominal rates.
+    """
+    generators = {}
+    for idx, (bus, size) in enumerate(GEN_LAYOUT, 1):
+        gid = f"G{idx}"
+        FOR, mttr = GEN_TYPES[size]
+        lam_phys, mu_phys = rates_from_FOR_MTTR(FOR, mttr)
+
+        cyber = {
+            "lambda_A": 1.0 / (1127.8 * 24),  # attack rate per hour
+            "theta": 0.2,                     # split probability
+            "mu_M": 40.0 / HOURS_PER_YEAR,
+            "mu_R": 876.0 / HOURS_PER_YEAR,
+            "mu_p": 876.0 / HOURS_PER_YEAR,
+            "lambda_f": lam_phys * 0.15,
+            "lambda_p": lam_phys,
+            "mu": mu_phys,
+        }
+
+        generators[gid] = {
+            "bus": bus,
+            "capacity": float(size),
+            "nominal": cyber
+        }
+
+    lines = {}
+    for i, (fb, tb, x, lim, lam_yr, dur) in enumerate(LINE_DATA, 1):
+        lid = f"L{i}"
+        lam_phys, mu_phys = rates_from_lambdaP_duration(lam_yr, dur)
+
+        cyber = {
+            "lambda_A": 1.0 / (1127.8 * 24),
+            "theta": 0.2,
+            "mu_M": 40.0 / HOURS_PER_YEAR,
+            "mu_R": 876.0 / HOURS_PER_YEAR,
+            "mu_p": 876.0 / HOURS_PER_YEAR,
+            "lambda_f": lam_phys * 0.15,
+            "lambda_p": lam_phys,
+            "mu": mu_phys,
+        }
+
+        lines[lid] = {
+            "from": fb,
+            "to": tb,
+            "x": float(x),
+            "limit": float(lim),
+            "nominal": cyber
+        }
+
+    wind_farms = {}
+    for i, (bus, cap) in enumerate(WIND_FARMS, 1):
+        wid = f"W{i}"
+        wind_farms[wid] = {
+            "bus": bus,
+            "capacity": float(cap),
+            "lam": 1.0 / (60.0 * 24.0),
+            "mu": 1.0 / 12.0
+        }
+
+    loads = {k: float(v) for k, v in LOAD_DATA.items()}
+    return generators, lines, wind_farms, loads
+
+
+# ==================== 6-State Q Matrix ====================
+
+def build_q_matrix(cyber_rates: Dict[str, float]) -> np.ndarray:
+    """
+    Build 6x6 generator matrix Q from transition parameters.
+    """
+    Q = np.zeros((6, 6), dtype=float)
+
+    Q[0, 1] = cyber_rates["lambda_A"] * cyber_rates["theta"]
+    Q[0, 2] = cyber_rates["lambda_A"] * (1.0 - cyber_rates["theta"])
+    Q[0, 5] = cyber_rates["lambda_f"]
+
+    Q[1, 0] = cyber_rates["mu_M"]
+    Q[1, 2] = cyber_rates["lambda_A"]
+
+    Q[2, 0] = cyber_rates["mu_R"]
+    Q[2, 3] = cyber_rates["lambda_p"] * 0.5
+    Q[2, 4] = cyber_rates["lambda_p"] * 0.5
+
+    Q[3, 0] = cyber_rates["mu_R"]
+    Q[3, 4] = cyber_rates["lambda_p"]
+
+    Q[4, 0] = cyber_rates["mu"]
+
+    Q[5, 0] = cyber_rates["mu_p"]
+    Q[5, 3] = cyber_rates["lambda_p"]
+
+    for i in range(6):
+        Q[i, i] = -np.sum(Q[i, :])
+
+    return Q
+
+
+def component_steady_state_from_q(Q: np.ndarray,
+                                  service_states: Tuple[int, ...] = SERVICE_STATES) -> float:
+    """
+    Solve pi Q = 0 with sum(pi)=1 and return in-service probability.
+    """
+    A = Q.T.copy()
+    A[-1, :] = 1.0
+    b = np.zeros(6, dtype=float)
+    b[-1] = 1.0
+
+    pi = np.linalg.solve(A, b)
+    pi = np.maximum(pi, 0.0)
+    s = np.sum(pi)
+    if s <= EPS:
+        raise RuntimeError("Invalid steady-state solution.")
+    pi /= s
+
+    p_in = float(np.sum([pi[i] for i in service_states]))
+    return float(np.clip(p_in, 0.0, 1.0))
+
+
+def component_steady_state(cyber_rates: Dict[str, float],
+                           service_states: Tuple[int, ...] = SERVICE_STATES) -> float:
+    Q = build_q_matrix(cyber_rates)
+    return component_steady_state_from_q(Q, service_states=service_states)
+
+
+# ==================== Component-Wise Parameter Application ====================
+
+def multiplier_bounds_for_rate(rate_key: str) -> List[float]:
+    """
+    Bounds for per-component multipliers.
+    """
+    if rate_key == "theta":
+        return [0.5, 1.5]
+    return [0.5, 2.0]
+
+
+def apply_component_multipliers(nominal: Dict[str, float],
+                                params: Dict[str, float],
+                                component_id: str) -> Dict[str, float]:
+    """
+    Apply sampled multipliers to this specific component's nominal transition rates.
+    Parameter names are of the form:
+        s_<rate>_<component_id>
+    Examples:
+        s_lambda_A_G1
+        s_mu_R_L17
+    """
+    out = nominal.copy()
+
+    out["lambda_A"] = clamp_pos(nominal["lambda_A"] * params[f"s_lambda_A_{component_id}"])
+    out["theta"]    = clamp_prob(nominal["theta"] * params[f"s_theta_{component_id}"])
+    out["mu_M"]     = clamp_pos(nominal["mu_M"] * params[f"s_mu_M_{component_id}"])
+    out["mu_R"]     = clamp_pos(nominal["mu_R"] * params[f"s_mu_R_{component_id}"])
+    out["mu_p"]     = clamp_pos(nominal["mu_p"] * params[f"s_mu_p_{component_id}"])
+    out["lambda_f"] = clamp_pos(nominal["lambda_f"] * params[f"s_lambda_f_{component_id}"])
+    out["lambda_p"] = clamp_pos(nominal["lambda_p"] * params[f"s_lambda_p_{component_id}"])
+    out["mu"]       = clamp_pos(nominal["mu"] * params[f"s_mu_{component_id}"])
+
+    return out
+
+
+# ==================== DC-OPF ====================
+
+class DCOPF:
+    """
+    Linear DC-OPF screening model.
+    Objective: minimize total load shed.
+    """
+
+    def __init__(self, buses: List[int], slack_bus: int = 1):
+        self.buses = sorted(buses)
+        self.slack = slack_bus
+        if slack_bus not in self.buses:
+            raise ValueError("Slack bus not present in bus list.")
+
+        self.non_slack = [b for b in self.buses if b != slack_bus]
+        self.theta_index = {b: i for i, b in enumerate(self.non_slack)}
+        self.bus_pos = {b: i for i, b in enumerate(self.buses)}
+
+    def solve(self,
+              generators: Dict[str, dict],
+              lines: Dict[str, dict],
+              loads: Dict[int, float],
+              gen_avail: Dict[str, float],
+              wind_power: Dict[int, float],
+              load_scale: float = 1.0) -> float:
+        gen_ids = list(generators.keys())
+        load_buses = sorted(loads.keys())
+
+        n_gen = len(gen_ids)
+        n_load = len(load_buses)
+        n_theta = len(self.non_slack)
+        n_var = n_gen + n_load + n_theta
+
+        iPg = 0
+        iShed = n_gen
+        iTheta = n_gen + n_load
+
+        gen_index = {gid: i for i, gid in enumerate(gen_ids)}
+        load_index = {b: i for i, b in enumerate(load_buses)}
+
+        # Objective
+        c = np.zeros(n_var, dtype=float)
+        c[iShed:iShed + n_load] = 1.0
+
+        # Bounds
+        bounds = []
+        for gid in gen_ids:
+            bounds.append((0.0, max(0.0, float(gen_avail.get(gid, 0.0)))))
+        for b in load_buses:
+            bounds.append((0.0, loads[b] * load_scale))
+        for _ in self.non_slack:
+            bounds.append((-np.pi, np.pi))
+
+        # Build B matrix
+        n_bus = len(self.buses)
+        B = np.zeros((n_bus, n_bus), dtype=float)
+
+        for line in lines.values():
+            fb, tb, x = line["from"], line["to"], line["x"]
+            if x <= 0:
+                continue
+            bij = 1.0 / x
+            i = self.bus_pos[fb]
+            j = self.bus_pos[tb]
+            B[i, i] += bij
+            B[j, j] += bij
+            B[i, j] -= bij
+            B[j, i] -= bij
+
+        B *= BASE_MVA
+
+        # Equality constraints
+        A_eq = np.zeros((n_bus, n_var), dtype=float)
+        b_eq = np.zeros(n_bus, dtype=float)
+
+        gen_by_bus = {}
+        for gid, g in generators.items():
+            gen_by_bus.setdefault(g["bus"], []).append(gid)
+
+        for bi, bus in enumerate(self.buses):
+            for gid in gen_by_bus.get(bus, []):
+                A_eq[bi, iPg + gen_index[gid]] += 1.0
+
+            if bus in loads:
+                A_eq[bi, iShed + load_index[bus]] += 1.0
+
+            for b2 in self.non_slack:
+                j = self.theta_index[b2]
+                A_eq[bi, iTheta + j] -= B[self.bus_pos[bus], self.bus_pos[b2]]
+
+            b_eq[bi] = loads.get(bus, 0.0) * load_scale - wind_power.get(bus, 0.0)
+
+        # Inequality constraints: line limits
+        A_ub = []
+        b_ub = []
+
+        for line in lines.values():
+            fb, tb, x, lim = line["from"], line["to"], line["x"], line["limit"]
+            if x <= 0 or lim <= 0:
+                continue
+
+            coef = BASE_MVA / x
+            row = np.zeros(n_var, dtype=float)
+
+            if fb != self.slack:
+                row[iTheta + self.theta_index[fb]] = coef
+            if tb != self.slack:
+                row[iTheta + self.theta_index[tb]] = -coef
+
+            A_ub.append(row.copy())
+            b_ub.append(lim)
+
+            A_ub.append(-row)
+            b_ub.append(lim)
+
+        A_ub = np.array(A_ub, dtype=float) if A_ub else None
+        b_ub = np.array(b_ub, dtype=float) if b_ub else None
+
+        res = linprog(
+            c,
+            A_ub=A_ub, b_ub=b_ub,
+            A_eq=A_eq, b_eq=b_eq,
+            bounds=bounds,
+            method="highs"
+        )
+
+        if not res.success:
+            # Conservative fallback
+            return float(sum(loads.values()) * load_scale)
+
+        shed = float(np.sum(res.x[iShed:iShed + n_load]))
+        return max(0.0, shed)
+
+
+# ==================== Contingency Enumeration ====================
+
+def select_lines_for_enumeration(lines: Dict[str, dict], enum_top_lines: int = None) -> List[str]:
+    """
+    Choose explicitly uncertain lines in reduced outage model.
+
+    Heuristic score:
+        score = nominal lambda_p / limit
+    """
+    all_line_ids = list(lines.keys())
+    if enum_top_lines is None or enum_top_lines >= len(all_line_ids):
+        return all_line_ids
+
+    ranked = sorted(
+        lines.items(),
+        key=lambda kv: (kv[1]["nominal"]["lambda_p"] / max(kv[1]["limit"], EPS)),
+        reverse=True
+    )
+    return [lid for lid, _ in ranked[:enum_top_lines]]
+
+
+def enumerate_truncated_contingencies(selected_components: List[Tuple[str, str]],
+                                      p_up: Dict[Tuple[str, str], float],
+                                      max_outages: int):
+    """
+    Enumerate exact probabilities over the selected uncertain subset,
+    truncated at outage count <= max_outages.
+    """
+    contingencies = []
+    n = len(selected_components)
+
+    if max_outages < 0:
+        raise ValueError("max_outages must be >= 0")
+
+    for k in range(0, min(max_outages, n) + 1):
+        for out_idx in itertools.combinations(range(n), k):
+            out_idx_set = set(out_idx)
+            prob = 1.0
+            out_g = []
+            out_l = []
+
+            for i, comp in enumerate(selected_components):
+                pu = float(np.clip(p_up[comp], EPS, 1.0 - EPS))
+                if i in out_idx_set:
+                    prob *= (1.0 - pu)
+                    if comp[0] == "G":
+                        out_g.append(comp[1])
+                    else:
+                        out_l.append(comp[1])
+                else:
+                    prob *= pu
+
+            contingencies.append((out_g, out_l, prob))
+
+    enum_mass = float(sum(p for _, _, p in contingencies))
+    enum_mass = float(np.clip(enum_mass, 0.0, 1.0))
+    tail_mass = max(0.0, 1.0 - enum_mass)
+    return contingencies, enum_mass, tail_mass
+
+
+# ==================== Inner Monte Carlo ====================
+
+def inner_monte_carlo_conditional(generators: Dict[str, dict],
+                                  active_lines: Dict[str, dict],
+                                  wind_farms: Dict[str, dict],
+                                  loads: Dict[int, float],
+                                  opf: DCOPF,
+                                  gen_avail: Dict[str, float],
+                                  params: Dict[str, float],
+                                  n_trials: int = 100,
+                                  seed: int = 123) -> Tuple[float, float]:
+    """
+    Conditional on fixed component outage contingency:
+      - sample only wind availability + wind speed
+      - sample only load uncertainty
+    """
+    rng = np.random.default_rng(seed)
+    total_shed = 0.0
+    count_shed = 0
+
+    k = float(params["wind_k"])
+    wind_scale = float(params["wind_scale"])
+    load_sigma = float(params["load_sigma"])
+
+    for _ in range(n_trials):
+        wind_power = {}
+
+        # Wind availability + wind production
+        for _, winfo in wind_farms.items():
+            lam_w = winfo["lam"]
+            mu_w = winfo["mu"]
+            p_up_w = mu_w / (lam_w + mu_w + EPS)
+
+            if rng.random() >= p_up_w:
+                continue
+
+            v = weibull_min.rvs(c=k, scale=wind_scale, random_state=rng)
+            cf = wind_power_cf(float(v))
+            bus = winfo["bus"]
+            wind_power[bus] = wind_power.get(bus, 0.0) + cf * winfo["capacity"]
+
+        # Load
+        z = float(rng.normal())
+        load_scale = lognormal_multiplier_from_z(z, load_sigma)
+
+        shed = opf.solve(
+            generators=generators,
+            lines=active_lines,
+            loads=loads,
+            gen_avail=gen_avail,
+            wind_power=wind_power,
+            load_scale=load_scale
+        )
+
+        total_shed += shed
+        if shed > 1e-6:
+            count_shed += 1
+
+    return total_shed / max(n_trials, 1), count_shed / max(n_trials, 1)
+
+
+# ==================== Reliability Model ====================
+
+def compute_reliability(params: Dict[str, float],
+                        max_outages: int = 2,
+                        enum_top_lines: int = 10,
+                        inner_trials: int = 100,
+                        seed: int = 123):
+    """
+    Compute reliability for one Sobol sample.
+
+    Returns:
+      LOLP, EENS, enum_mass, tail_mass, n_conts,
+      mean_p_up_gen, mean_p_up_line,
+      p_up_gen_dict, p_up_line_dict
+    """
+    generators, lines, wind_farms, loads = build_system()
+
+    all_buses = (
+        set(loads.keys())
+        | {g["bus"] for g in generators.values()}
+        | {w["bus"] for w in wind_farms.values()}
+        | {l["from"] for l in lines.values()}
+        | {l["to"] for l in lines.values()}
+    )
+    opf = DCOPF(sorted(all_buses), slack_bus=1)
+
+    # Apply per-component sampled multipliers
+    gen_rates = {}
+    p_up_gen = {}
+    for gid, ginfo in generators.items():
+        cyber = apply_component_multipliers(ginfo["nominal"], params, component_id=gid)
+        gen_rates[gid] = cyber
+        p_up_gen[gid] = component_steady_state(cyber)
+
+    line_rates = {}
+    p_up_line = {}
+    for lid, linfo in lines.items():
+        cyber = apply_component_multipliers(linfo["nominal"], params, component_id=lid)
+        line_rates[lid] = cyber
+        p_up_line[lid] = component_steady_state(cyber)
+
+    # All generators uncertain; top subset of lines explicitly uncertain
+    enum_line_ids = select_lines_for_enumeration(lines, enum_top_lines=enum_top_lines)
+
+    selected_components = [("G", gid) for gid in generators.keys()] + [("L", lid) for lid in enum_line_ids]
+    p_up = {("G", gid): p_up_gen[gid] for gid in generators.keys()}
+    p_up.update({("L", lid): p_up_line[lid] for lid in enum_line_ids})
+
+    contingencies, enum_mass, tail_mass = enumerate_truncated_contingencies(
+        selected_components=selected_components,
+        p_up=p_up,
+        max_outages=max_outages
+    )
+
+    LOLP = 0.0
+    EENS = 0.0
+
+    for c_idx, (out_g, out_l, p_k) in enumerate(contingencies):
+        if p_k <= 0.0:
+            continue
+
+        out_g_set = set(out_g)
+        out_l_set = set(out_l)
+
+        # Generator capacities fixed by contingency
+        gen_avail = {}
+        for gid, ginfo in generators.items():
+            gen_avail[gid] = 0.0 if gid in out_g_set else ginfo["capacity"]
+
+        # Non-enumerated lines are treated as always available in this reduced model
+        active_lines = {lid: linfo for lid, linfo in lines.items() if lid not in out_l_set}
+
+        mc_seed = stable_seed(seed, "cont", c_idx, tuple(sorted(out_g)), tuple(sorted(out_l)))
+
+        E_shed_k, P_shed_k = inner_monte_carlo_conditional(
+            generators=generators,
+            active_lines=active_lines,
+            wind_farms=wind_farms,
+            loads=loads,
+            opf=opf,
+            gen_avail=gen_avail,
+            params=params,
+            n_trials=inner_trials,
+            seed=mc_seed
+        )
+
+        LOLP += p_k * P_shed_k
+        EENS += p_k * E_shed_k * HOURS_PER_YEAR
+
+    mean_p_up_gen = float(np.mean(list(p_up_gen.values())))
+    mean_p_up_line = float(np.mean(list(p_up_line.values())))
+
+    return (
+        float(LOLP),
+        float(EENS),
+        float(enum_mass),
+        float(tail_mass),
+        len(contingencies),
+        mean_p_up_gen,
+        mean_p_up_line,
+        p_up_gen,
+        p_up_line,
+    )
+
+
+# ==================== Sobol Problem (Full Component-Wise) ====================
+
+def build_sobol_problem() -> dict:
+    """
+    Build full component-wise Sobol problem:
+      - one multiplier for each of 8 rate families for each generator
+      - one multiplier for each of 8 rate families for each line
+      - wind_k, wind_mean, load_sigma
+    """
+    generators, lines, _, _ = build_system()
+
+    names = []
+    bounds = []
+
+    # Generators
+    for gid in generators.keys():
+        for rate_key in RATE_KEYS:
+            names.append(f"s_{rate_key}_{gid}")
+            bounds.append(multiplier_bounds_for_rate(rate_key))
+
+    # Lines
+    for lid in lines.keys():
+        for rate_key in RATE_KEYS:
+            names.append(f"s_{rate_key}_{lid}")
+            bounds.append(multiplier_bounds_for_rate(rate_key))
+
+    # Wind / load
+    names.extend(["wind_k", "wind_mean", "load_sigma"])
+    bounds.extend([
+        [1.5, 3.0],   # wind_k
+        [6.0, 10.0],  # wind_mean
+        [0.03, 0.12], # load_sigma
+    ])
+
+    if len(names) != len(bounds):
+        raise ValueError("Sobol problem misconfigured: names/bounds mismatch.")
+
+    return {
+        "num_vars": len(names),
+        "names": names,
+        "bounds": bounds
+    }
+
+
+def build_nominal_rates_table() -> pd.DataFrame:
+    """
+    Save nominal transition rates for every component.
+    """
+    generators, lines, _, _ = build_system()
+    rows = []
+
+    for gid, ginfo in generators.items():
+        row = {"component_id": gid, "component_type": "generator"}
+        row.update(ginfo["nominal"])
+        rows.append(row)
+
+    for lid, linfo in lines.items():
+        row = {"component_id": lid, "component_type": "line"}
+        row.update(linfo["nominal"])
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+# ==================== Sobol Driver ====================
+
+def run_sobol(n_samples: int,
+              inner_trials: int,
+              max_outages: int,
+              enum_top_lines: int,
+              seed: int):
+    """
+    Run full component-wise Sobol sensitivity and save all results.
+    """
+    problem = build_sobol_problem()
+
+    print("Generating Sobol samples...")
+    param_values = saltelli.sample(problem, n_samples, calc_second_order=False)
+    n_eval = len(param_values)
+    print(f"Base Sobol N = {n_samples}")
+    print(f"Total model evaluations = {n_eval}")
+
+    Y_lolp = np.zeros(n_eval, dtype=float)
+    Y_eens = np.zeros(n_eval, dtype=float)
+    Y_enum_mass = np.zeros(n_eval, dtype=float)
+    Y_tail_mass = np.zeros(n_eval, dtype=float)
+    Y_n_conts = np.zeros(n_eval, dtype=int)
+    Y_mean_p_up_gen = np.zeros(n_eval, dtype=float)
+    Y_mean_p_up_line = np.zeros(n_eval, dtype=float)
+
+    availability_rows = []
+
+    generators, lines, _, _ = build_system()
+    gen_ids = list(generators.keys())
+    line_ids = list(lines.keys())
+
+    for i, row in enumerate(param_values):
+        params = {name: float(row[j]) for j, name in enumerate(problem["names"])}
+        params["wind_scale"] = weibull_scale_from_mean(params["wind_mean"], params["wind_k"])
+
+        sample_seed = stable_seed(seed, "sample", i)
+        print(f"Evaluating sample {i + 1}/{n_eval}...")
+
+        (
+            lolp, eens, enum_mass, tail_mass, n_conts,
+            mean_p_up_gen, mean_p_up_line,
+            p_up_gen, p_up_line
+        ) = compute_reliability(
+            params=params,
+            max_outages=max_outages,
+            enum_top_lines=enum_top_lines,
+            inner_trials=inner_trials,
+            seed=sample_seed
+        )
+
+        Y_lolp[i] = lolp
+        Y_eens[i] = eens
+        Y_enum_mass[i] = enum_mass
+        Y_tail_mass[i] = tail_mass
+        Y_n_conts[i] = n_conts
+        Y_mean_p_up_gen[i] = mean_p_up_gen
+        Y_mean_p_up_line[i] = mean_p_up_line
+
+        # Save per-sample component availabilities
+        avail_row = {"sample_id": i}
+        for gid in gen_ids:
+            avail_row[f"p_up_{gid}"] = p_up_gen[gid]
+        for lid in line_ids:
+            avail_row[f"p_up_{lid}"] = p_up_line[lid]
+        availability_rows.append(avail_row)
+
+    print("\nComputing Sobol indices...")
+    Si_lolp = sobol.analyze(problem, Y_lolp, calc_second_order=False, print_to_console=False)
+    Si_eens = sobol.analyze(problem, Y_eens, calc_second_order=False, print_to_console=False)
+
+    print("\n" + "=" * 78)
+    print("Top Sobol parameters for LOLP (by ST)")
+    print("=" * 78)
+    top_idx_lolp = np.argsort(-np.nan_to_num(Si_lolp["ST"], nan=-np.inf))[:15]
+    for j in top_idx_lolp:
+        print(
+            f"{problem['names'][j]:20s}: "
+            f"S1 = {Si_lolp['S1'][j]: .6f} ± {Si_lolp['S1_conf'][j]: .6f} | "
+            f"ST = {Si_lolp['ST'][j]: .6f} ± {Si_lolp['ST_conf'][j]: .6f}"
+        )
+
+    print("\n" + "=" * 78)
+    print("Top Sobol parameters for EENS (by ST)")
+    print("=" * 78)
+    top_idx_eens = np.argsort(-np.nan_to_num(Si_eens["ST"], nan=-np.inf))[:15]
+    for j in top_idx_eens:
+        print(
+            f"{problem['names'][j]:20s}: "
+            f"S1 = {Si_eens['S1'][j]: .6f} ± {Si_eens['S1_conf'][j]: .6f} | "
+            f"ST = {Si_eens['ST'][j]: .6f} ± {Si_eens['ST_conf'][j]: .6f}"
+        )
+
+    print("\n" + "=" * 78)
+    print("Diagnostics")
+    print("=" * 78)
+    print(f"Mean enumerated mass     : {np.mean(Y_enum_mass):.6f}")
+    print(f"Mean truncated tail mass : {np.mean(Y_tail_mass):.6f}")
+    print(f"Mean # contingencies     : {np.mean(Y_n_conts):.1f}")
+    print(f"Mean generator p_up      : {np.mean(Y_mean_p_up_gen):.6f}")
+    print(f"Mean line p_up           : {np.mean(Y_mean_p_up_line):.6f}")
+
+    # Save raw sample results
+    results_df = pd.DataFrame(param_values, columns=problem["names"])
+    results_df["wind_scale"] = [weibull_scale_from_mean(results_df.loc[i, "wind_mean"], results_df.loc[i, "wind_k"])
+                                for i in range(len(results_df))]
+    results_df["LOLP"] = Y_lolp
+    results_df["EENS_MWh_per_year"] = Y_eens
+    results_df["enum_mass"] = Y_enum_mass
+    results_df["tail_mass"] = Y_tail_mass
+    results_df["n_contingencies"] = Y_n_conts
+    results_df["mean_p_up_gen"] = Y_mean_p_up_gen
+    results_df["mean_p_up_line"] = Y_mean_p_up_line
+    results_df.to_csv("sobol_results_full_component.csv", index=False)
+
+    # Save per-sample component availabilities
+    availability_df = pd.DataFrame(availability_rows)
+    availability_df.to_csv("component_availability_full_component.csv", index=False)
+
+    # Save Sobol summary
+    sobol_summary_df = pd.DataFrame({
+        "parameter": problem["names"],
+        "S1_LOLP": Si_lolp["S1"],
+        "S1_conf_LOLP": Si_lolp["S1_conf"],
+        "ST_LOLP": Si_lolp["ST"],
+        "ST_conf_LOLP": Si_lolp["ST_conf"],
+        "S1_EENS": Si_eens["S1"],
+        "S1_conf_EENS": Si_eens["S1_conf"],
+        "ST_EENS": Si_eens["ST"],
+        "ST_conf_EENS": Si_eens["ST_conf"],
+    })
+    sobol_summary_df.to_csv("sobol_indices_summary_full_component.csv", index=False)
+
+    # Save nominal component rates
+    nominal_df = build_nominal_rates_table()
+    nominal_df.to_csv("nominal_component_rates_full_component.csv", index=False)
+
+    print("\nSaved files:")
+    print("  - sobol_results_full_component.csv")
+    print("  - component_availability_full_component.csv")
+    print("  - sobol_indices_summary_full_component.csv")
+    print("  - nominal_component_rates_full_component.csv")
+
+
+# ==================== Main ====================
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="RTS-96 reliability + FULL component-wise Sobol sensitivity (563D)"
+    )
+
+    # Keep default very small because 563D Sobol is extremely expensive
+    parser.add_argument(
+        "--n-samples", type=int, default=2,
+        help="Base Sobol sample size N. Total evaluations ~= N*(D+2) = N*565."
+    )
+    parser.add_argument(
+        "--inner-trials", type=int, default=50,
+        help="Inner Monte Carlo trials per contingency."
+    )
+    parser.add_argument(
+        "--max-outages", type=int, default=1,
+        help="Maximum outage order in truncated contingency enumeration."
+    )
+    parser.add_argument(
+        "--enum-top-lines", type=int, default=8,
+        help="Number of most critical lines explicitly modeled as uncertain."
+    )
+    parser.add_argument(
+        "--seed", type=int, default=123,
+        help="Base random seed."
+    )
+
+    args = parser.parse_args()
+
+    problem = build_sobol_problem()
+    approx_evals = args.n_samples * (problem["num_vars"] + 2)
+
+    print("=" * 78)
+    print("Run configuration")
+    print("=" * 78)
+    print(f"Sobol dimension          : {problem['num_vars']}")
+    print(f"Sobol base N            : {args.n_samples}")
+    print(f"Approx total evaluations: {approx_evals}")
+    print(f"Inner MC trials         : {args.inner_trials}")
+    print(f"Max outage order        : {args.max_outages}")
+    print(f"Enumerated lines        : {args.enum_top_lines}")
+    print(f"Seed                    : {args.seed}")
+    print("=" * 78)
+
+    run_sobol(
+        n_samples=args.n_samples,
+        inner_trials=args.inner_trials,
+        max_outages=args.max_outages,
+        enum_top_lines=args.enum_top_lines,
+        seed=args.seed
+    )
+
+
+if __name__ == "__main__":
+    main()

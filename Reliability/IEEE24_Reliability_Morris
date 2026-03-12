@@ -1,0 +1,617 @@
+"""
+morris_screening.py
+====================
+Morris Elementary Effects screening for the RTS-96 cyber-physical reliability model.
+
+PURPOSE
+-------
+The full Sobol analysis has D = 563 parameters.  Running N = 64 Sobol samples
+requires 36,160 model evaluations — expensive.  Morris screening runs first and
+identifies which of the 563 parameters actually move the output.  The rest get
+fixed at their nominal multiplier value (1.0), leaving a much smaller "active"
+set for a proper Sobol run.
+
+HOW MORRIS WORKS (plain English)
+---------------------------------
+Morris takes one parameter at a time and nudges it by a small step (Δ),
+holding everything else constant.  The ratio:
+
+    EE_i = [ f(x_1, ..., x_i + Δ, ..., x_D) - f(x_1, ..., x_i, ..., x_D) ] / Δ
+
+is the "Elementary Effect" of parameter i in that trajectory.
+
+Repeat this across r independent random starting points (trajectories).
+Collect r Elementary Effects per parameter and summarise as:
+
+    μ*  = mean |EE|   ← how influential is this parameter on average?
+    σ   = std  (EE)   ← does it interact with other parameters?
+
+Parameters with high μ* AND high σ  → important + interactive (keep in Sobol)
+Parameters with high μ* AND low  σ  → important + linear (still keep)
+Parameters with low  μ*             → negligible (fix at nominal = 1.0)
+
+COST
+----
+    r trajectories × (D + 1) evaluations per trajectory
+    r = 20, D = 563  →  20 × 564 = 11,280 evaluations
+
+Compare to Sobol N=64:  64 × 565 = 36,160 evaluations.
+Morris is ~3× cheaper and tells you which dimensions matter.
+
+OUTPUT FILES
+------------
+1. morris_results.csv          — μ*, σ, rank for all 563 parameters (LOLP + EENS)
+2. morris_active_params.json   — the reduced parameter list to pass to Sobol
+3. morris_mu_star_lolp.png     — μ* vs σ scatter plot for LOLP
+4. morris_mu_star_eens.png     — μ* vs σ scatter plot for EENS
+5. morris_top_bar.png          — side-by-side bar chart, top 40 by μ* (LOLP + EENS)
+
+USAGE
+-----
+# Quick test — 5 trajectories, 20 inner trials, 6 enumerated lines
+python morris_screening.py --trajectories 5 --inner-trials 20 --enum-top-lines 6
+
+# Recommended screening run — 20 trajectories, 50 inner trials
+python morris_screening.py --trajectories 20 --inner-trials 50 --enum-top-lines 8
+
+# On ACCRE with 20 cores
+python morris_screening.py --trajectories 20 --inner-trials 50 --enum-top-lines 8 --n-jobs 20
+
+THEN, pass the reduced parameter set to your Sobol run:
+python rts96_sobol.py --mode reduced --active-params morris_active_params.json \
+       --n-samples 512 --inner-trials 50
+"""
+
+import argparse
+import json
+import os
+import sys
+import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from typing import Dict, List, Tuple
+
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from SALib.sample.morris import sample as morris_sample
+from SALib.analyze import morris as morris_analyze
+
+# ── import everything from the existing model ─────────────────────────────────
+# The full_component_sobol.py must be in the same directory (or on PYTHONPATH).
+try:
+    from full_component_sobol import (
+        build_sobol_problem,
+        build_system,
+        compute_reliability,
+        weibull_scale_from_mean,
+        stable_seed,
+        RATE_KEYS,
+    )
+except ImportError as e:
+    sys.exit(
+        f"\n[ERROR] Cannot import from full_component_sobol.py.\n"
+        f"Make sure full_component_sobol.py is in the same directory.\n"
+        f"Original error: {e}\n"
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MODEL WRAPPER
+# ══════════════════════════════════════════════════════════════════════════════
+
+def evaluate_single(args_tuple):
+    """
+    Evaluate one Morris sample row.
+    Called by the parallel worker pool — must be a top-level function
+    (pickle-able) so ProcessPoolExecutor can ship it to worker processes.
+
+    Parameters
+    ----------
+    args_tuple : (i, row, param_names, max_outages, enum_top_lines,
+                  inner_trials, base_seed)
+
+    Returns
+    -------
+    (i, lolp, eens)
+    """
+    (i, row, param_names, max_outages, enum_top_lines, inner_trials, base_seed) = args_tuple
+
+    # Build the params dict exactly as compute_reliability expects
+    params = {name: float(row[j]) for j, name in enumerate(param_names)}
+
+    # Derived quantity that compute_reliability needs
+    params["wind_scale"] = weibull_scale_from_mean(
+        params["wind_mean"], params["wind_k"]
+    )
+
+    sample_seed = stable_seed(base_seed, "morris", i)
+
+    lolp, eens, *_ = compute_reliability(
+        params=params,
+        max_outages=max_outages,
+        enum_top_lines=enum_top_lines,
+        inner_trials=inner_trials,
+        seed=sample_seed,
+    )
+    return (i, float(lolp), float(eens))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MORRIS ANALYSIS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def run_morris(
+    n_trajectories: int,
+    inner_trials: int,
+    max_outages: int,
+    enum_top_lines: int,
+    n_jobs: int,
+    seed: int,
+    num_levels: int,
+    threshold_percentile: float,
+    output_dir: str,
+):
+    os.makedirs(output_dir, exist_ok=True)
+
+    # ── Build problem (same 563 dimensions as Sobol) ─────────────────────────
+    problem = build_sobol_problem()
+    D = problem["num_vars"]
+    n_eval = n_trajectories * (D + 1)
+
+    print("=" * 70)
+    print("Morris Elementary Effects Screening — RTS-96 CPPS")
+    print("=" * 70)
+    print(f"  Parameters (D)        : {D}")
+    print(f"  Trajectories (r)      : {n_trajectories}")
+    print(f"  Evaluations (r×(D+1)) : {n_eval}")
+    print(f"  Inner MC trials       : {inner_trials}")
+    print(f"  Enum top lines        : {enum_top_lines}")
+    print(f"  Parallel workers      : {n_jobs}")
+    print(f"  Output directory      : {output_dir}/")
+    print("=" * 70)
+
+    # ── Generate Morris sample matrix ─────────────────────────────────────────
+    print("\n[1/4] Generating Morris trajectories...")
+    rng_seed = seed % (2**31 - 1)
+    X = morris_sample(
+        problem,
+        N=n_trajectories,
+        num_levels=num_levels,
+        seed=rng_seed,
+    )
+    print(f"      Sample matrix shape: {X.shape}  ({X.shape[0]} rows × {X.shape[1]} params)")
+
+    # ── Evaluate model ─────────────────────────────────────────────────────────
+    print(f"\n[2/4] Evaluating model ({n_eval} runs)...")
+
+    Y_lolp = np.full(n_eval, np.nan)
+    Y_eens = np.full(n_eval, np.nan)
+
+    t0 = time.time()
+
+    tasks = [
+        (i, X[i], problem["names"], max_outages, enum_top_lines, inner_trials, seed)
+        for i in range(n_eval)
+    ]
+
+    completed = 0
+    errors = 0
+
+    if n_jobs == 1:
+        # Sequential — easier to debug
+        for task in tasks:
+            try:
+                idx, lolp, eens = evaluate_single(task)
+                Y_lolp[idx] = lolp
+                Y_eens[idx] = eens
+            except Exception as exc:
+                errors += 1
+                print(f"      [WARN] sample {task[0]} failed: {exc}")
+            completed += 1
+            if completed % 50 == 0 or completed == n_eval:
+                elapsed = time.time() - t0
+                rate = completed / elapsed
+                eta = (n_eval - completed) / rate if rate > 0 else 0
+                print(
+                    f"      {completed}/{n_eval}  "
+                    f"elapsed {elapsed/60:.1f}m  "
+                    f"ETA {eta/60:.1f}m"
+                )
+    else:
+        # Parallel
+        with ProcessPoolExecutor(max_workers=n_jobs) as executor:
+            futures = {executor.submit(evaluate_single, t): t[0] for t in tasks}
+            for fut in as_completed(futures):
+                try:
+                    idx, lolp, eens = fut.result()
+                    Y_lolp[idx] = lolp
+                    Y_eens[idx] = eens
+                except Exception as exc:
+                    errors += 1
+                    print(f"      [WARN] sample failed: {exc}")
+                completed += 1
+                if completed % 100 == 0 or completed == n_eval:
+                    elapsed = time.time() - t0
+                    rate = completed / elapsed
+                    eta = (n_eval - completed) / rate if rate > 0 else 0
+                    print(
+                        f"      {completed}/{n_eval}  "
+                        f"elapsed {elapsed/60:.1f}m  "
+                        f"ETA {eta/60:.1f}m"
+                    )
+
+    elapsed_total = time.time() - t0
+    print(f"\n      Done in {elapsed_total/60:.1f} min  ({errors} errors)")
+
+    # Replace NaN from failed evaluations with column medians
+    if np.any(np.isnan(Y_lolp)):
+        Y_lolp = np.where(np.isnan(Y_lolp), np.nanmedian(Y_lolp), Y_lolp)
+    if np.any(np.isnan(Y_eens)):
+        Y_eens = np.where(np.isnan(Y_eens), np.nanmedian(Y_eens), Y_eens)
+
+    # ── Morris analysis ───────────────────────────────────────────────────────
+    print("\n[3/4] Computing Morris indices...")
+
+    Si_lolp = morris_analyze.analyze(
+        problem, X, Y_lolp,
+        num_resamples=100,
+        conf_level=0.95,
+        print_to_console=False,
+        num_levels=num_levels,
+        seed=rng_seed,
+    )
+    Si_eens = morris_analyze.analyze(
+        problem, X, Y_eens,
+        num_resamples=100,
+        conf_level=0.95,
+        print_to_console=False,
+        num_levels=num_levels,
+        seed=rng_seed,
+    )
+
+    mu_star_lolp = np.array(Si_lolp["mu_star"])
+    sigma_lolp   = np.array(Si_lolp["sigma"])
+    mu_star_eens = np.array(Si_eens["mu_star"])
+    sigma_eens   = np.array(Si_eens["sigma"])
+
+    # ── Rank and summarise ────────────────────────────────────────────────────
+    rank_lolp = np.argsort(-mu_star_lolp) + 1   # 1 = most influential
+    rank_eens = np.argsort(-mu_star_eens) + 1
+
+    results_df = pd.DataFrame({
+        "parameter":     problem["names"],
+        "mu_star_LOLP":  mu_star_lolp,
+        "sigma_LOLP":    sigma_lolp,
+        "rank_LOLP":     rank_lolp,
+        "mu_star_EENS":  mu_star_eens,
+        "sigma_EENS":    sigma_eens,
+        "rank_EENS":     rank_eens,
+    })
+    results_df = results_df.sort_values("mu_star_LOLP", ascending=False).reset_index(drop=True)
+
+    csv_path = os.path.join(output_dir, "morris_results.csv")
+    results_df.to_csv(csv_path, index=False)
+    print(f"      Saved: {csv_path}")
+
+    # ── Determine active (important) parameters ────────────────────────────────
+    # A parameter is "active" if its μ* is above the threshold percentile
+    # in EITHER the LOLP ranking OR the EENS ranking.
+    thresh_lolp = np.percentile(mu_star_lolp, threshold_percentile)
+    thresh_eens = np.percentile(mu_star_eens, threshold_percentile)
+
+    active_mask = (mu_star_lolp >= thresh_lolp) | (mu_star_eens >= thresh_eens)
+    active_params = [name for name, active in zip(problem["names"], active_mask) if active]
+
+    # Always keep the 3 wind/load parameters regardless of threshold
+    for p in ["wind_k", "wind_mean", "load_sigma"]:
+        if p not in active_params:
+            active_params.append(p)
+
+    inactive_params = [p for p in problem["names"] if p not in active_params]
+
+    print(f"\n      Threshold percentile : {threshold_percentile:.0f}th")
+    print(f"      Active parameters    : {len(active_params)}  (will be varied in Sobol)")
+    print(f"      Inactive parameters  : {len(inactive_params)}  (fixed at multiplier = 1.0)")
+
+    # Save active parameter list
+    active_info = {
+        "n_active":           len(active_params),
+        "n_inactive":         len(inactive_params),
+        "threshold_pct_lolp": float(thresh_lolp),
+        "threshold_pct_eens": float(thresh_eens),
+        "active_params":      active_params,
+        "inactive_params":    inactive_params,
+    }
+    json_path = os.path.join(output_dir, "morris_active_params.json")
+    with open(json_path, "w") as f:
+        json.dump(active_info, f, indent=2)
+    print(f"      Saved: {json_path}")
+
+    # Print top 20 for each metric
+    print("\n" + "─" * 70)
+    print("TOP 20 PARAMETERS — LOLP (by μ*)")
+    print("─" * 70)
+    print(f"{'Rank':>4}  {'Parameter':<28}  {'μ* (LOLP)':>12}  {'σ (LOLP)':>12}")
+    top20_lolp = results_df.nsmallest(20, "rank_LOLP")
+    for _, r in top20_lolp.iterrows():
+        print(f"  {int(r.rank_LOLP):>3}  {r.parameter:<28}  {r.mu_star_LOLP:>12.6f}  {r.sigma_LOLP:>12.6f}")
+
+    print("\n" + "─" * 70)
+    print("TOP 20 PARAMETERS — EENS (by μ*)")
+    print("─" * 70)
+    print(f"{'Rank':>4}  {'Parameter':<28}  {'μ* (EENS)':>12}  {'σ (EENS)':>12}")
+    top20_eens = results_df.nsmallest(20, "rank_EENS")
+    for _, r in top20_eens.iterrows():
+        print(f"  {int(r.rank_EENS):>3}  {r.parameter:<28}  {r.mu_star_EENS:>12.6f}  {r.sigma_EENS:>12.6f}")
+
+    # ── Plots ─────────────────────────────────────────────────────────────────
+    print("\n[4/4] Generating plots...")
+    _plot_mu_star_sigma(
+        results_df, mu_star_lolp, sigma_lolp,
+        title="Morris Screening — LOLP\n(μ* = mean absolute elementary effect)",
+        xlabel="μ* (LOLP)", ylabel="σ (LOLP)",
+        thresh=thresh_lolp,
+        out_path=os.path.join(output_dir, "morris_mu_star_lolp.png"),
+    )
+    _plot_mu_star_sigma(
+        results_df, mu_star_eens, sigma_eens,
+        title="Morris Screening — EENS\n(μ* = mean absolute elementary effect)",
+        xlabel="μ* (EENS)  [MWh/yr per unit]", ylabel="σ (EENS)",
+        thresh=thresh_eens,
+        out_path=os.path.join(output_dir, "morris_mu_star_eens.png"),
+    )
+    _plot_top_bar(
+        results_df,
+        out_path=os.path.join(output_dir, "morris_top_bar.png"),
+    )
+
+    print(f"\n{'='*70}")
+    print("SUMMARY")
+    print(f"{'='*70}")
+    print(f"  Total evaluations run  : {n_eval}")
+    print(f"  Wall time              : {elapsed_total/60:.1f} min")
+    print(f"  Active parameters      : {len(active_params)} / {D}")
+    print(f"  Dimension reduction    : {D} → {len(active_params)} ({100*(D - len(active_params))/D:.0f}% cut)")
+    print(f"\n  Sobol cost (original)  : N × {D+2} evaluations per sample")
+    print(f"  Sobol cost (reduced)   : N × {len(active_params)+2} evaluations per sample")
+    reduction_factor = (D + 2) / (len(active_params) + 2)
+    print(f"  Speed-up factor        : {reduction_factor:.1f}×")
+    print(f"\n  Next step:")
+    print(f"  python rts96_sobol.py --mode reduced \\")
+    print(f"         --active-params {json_path} \\")
+    print(f"         --n-samples 512 --inner-trials 50 --enum-top-lines 8")
+    print(f"{'='*70}\n")
+
+    return results_df, active_params
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PLOTTING HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Colour-code dots by parameter type so you can spot patterns instantly
+_TYPE_COLORS = {
+    "gen_physical":  "#E74C3C",   # red   — generator physical rates (lambda_f, lambda_p, mu)
+    "gen_cyber":     "#E67E22",   # orange — generator cyber rates (lambda_A, theta, mu_M, mu_R, mu_p)
+    "line_physical": "#2980B9",   # blue  — line physical rates
+    "line_cyber":    "#1ABC9C",   # teal  — line cyber rates
+    "wind_load":     "#8E44AD",   # purple — wind_k, wind_mean, load_sigma
+}
+
+_PHYSICAL_KEYS = {"lambda_f", "lambda_p", "mu"}
+_CYBER_KEYS    = {"lambda_A", "theta", "mu_M", "mu_R", "mu_p"}
+
+
+def _param_color(name: str) -> str:
+    if name in ("wind_k", "wind_mean", "load_sigma"):
+        return _TYPE_COLORS["wind_load"]
+    for rate in _PHYSICAL_KEYS:
+        if f"_{rate}_" in name or name.endswith(f"_{rate}"):
+            if "_G" in name:
+                return _TYPE_COLORS["gen_physical"]
+            else:
+                return _TYPE_COLORS["line_physical"]
+    for rate in _CYBER_KEYS:
+        if f"_{rate}_" in name or name.endswith(f"_{rate}"):
+            if "_G" in name:
+                return _TYPE_COLORS["gen_cyber"]
+            else:
+                return _TYPE_COLORS["line_cyber"]
+    return "#7F8C8D"
+
+
+def _plot_mu_star_sigma(df, mu_star, sigma, title, xlabel, ylabel, thresh, out_path):
+    fig, ax = plt.subplots(figsize=(10, 8))
+
+    colors = [_param_color(n) for n in df["parameter"].tolist()]
+
+    # All dots (small, semi-transparent)
+    ax.scatter(mu_star, sigma, c=colors, alpha=0.35, s=18, linewidths=0)
+
+    # Threshold vertical line
+    ax.axvline(thresh, color="black", linestyle="--", linewidth=1.2,
+               label=f"Threshold (μ* = {thresh:.4f})")
+
+    # Label top-15 by μ*
+    top15_idx = np.argsort(-mu_star)[:15]
+    for idx in top15_idx:
+        name = df["parameter"].iloc[idx]
+        ax.annotate(
+            name,
+            xy=(mu_star[idx], sigma[idx]),
+            fontsize=6.5,
+            ha="left", va="bottom",
+            xytext=(3, 3), textcoords="offset points",
+        )
+        ax.scatter(mu_star[idx], sigma[idx],
+                   c=colors[idx], s=50, zorder=5, linewidths=0.5, edgecolors="k")
+
+    # Legend for colours
+    patches = [
+        mpatches.Patch(color=v, label=k.replace("_", " ").title())
+        for k, v in _TYPE_COLORS.items()
+    ]
+    patches.append(
+        mpatches.Patch(color="none", label=f"Threshold line", linestyle="--")
+    )
+    ax.legend(handles=patches, fontsize=8, loc="upper left", framealpha=0.8)
+
+    ax.set_xlabel(xlabel, fontsize=11)
+    ax.set_ylabel(ylabel, fontsize=11)
+    ax.set_title(title, fontsize=12, fontweight="bold")
+    ax.grid(True, alpha=0.25)
+
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150)
+    plt.close()
+    print(f"      Saved: {out_path}")
+
+
+def _plot_top_bar(df, out_path, top_n=40):
+    top = df.head(top_n).copy()
+    params = top["parameter"].tolist()
+    y = np.arange(len(params))
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, max(8, top_n * 0.28)))
+
+    colors = [_param_color(p) for p in params]
+
+    # LOLP
+    ax1.barh(y, top["mu_star_LOLP"], color=colors, alpha=0.85, height=0.7)
+    ax1.set_yticks(y)
+    ax1.set_yticklabels(params, fontsize=7)
+    ax1.invert_yaxis()
+    ax1.set_xlabel("μ* (LOLP)", fontsize=10)
+    ax1.set_title(f"Top {top_n} — LOLP", fontsize=11, fontweight="bold")
+    ax1.grid(axis="x", alpha=0.3)
+
+    # EENS — re-sort by EENS for this panel
+    top_eens = df.nsmallest(top_n, "rank_EENS").copy()
+    params_e = top_eens["parameter"].tolist()
+    colors_e = [_param_color(p) for p in params_e]
+    ye = np.arange(len(params_e))
+
+    ax2.barh(ye, top_eens["mu_star_EENS"], color=colors_e, alpha=0.85, height=0.7)
+    ax2.set_yticks(ye)
+    ax2.set_yticklabels(params_e, fontsize=7)
+    ax2.invert_yaxis()
+    ax2.set_xlabel("μ* (EENS)  [MWh/yr per unit]", fontsize=10)
+    ax2.set_title(f"Top {top_n} — EENS", fontsize=11, fontweight="bold")
+    ax2.grid(axis="x", alpha=0.3)
+
+    # Shared colour legend
+    patches = [
+        mpatches.Patch(color=v, label=k.replace("_", " ").title())
+        for k, v in _TYPE_COLORS.items()
+    ]
+    fig.legend(handles=patches, fontsize=8, loc="lower center",
+               ncol=3, bbox_to_anchor=(0.5, -0.01), framealpha=0.9)
+
+    plt.suptitle("Morris Screening — Top Parameters by μ*\nRTS-96 Cyber-Physical Reliability",
+                 fontsize=12, fontweight="bold", y=1.01)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"      Saved: {out_path}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# REDUCED SOBOL HELPER  (bonus — build the reduced-dimension Sobol problem)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def build_reduced_sobol_problem(active_params_json: str) -> dict:
+    """
+    Build a SALib problem dict using only the active parameters identified
+    by Morris screening.  Inactive parameters will be fixed at 1.0 (nominal).
+
+    Usage (from your Sobol script):
+        from morris_screening import build_reduced_sobol_problem
+        problem = build_reduced_sobol_problem("morris_output/morris_active_params.json")
+        # then use problem with saltelli.sample() as normal
+    """
+    with open(active_params_json) as f:
+        info = json.load(f)
+
+    full_problem = build_sobol_problem()
+    full_bounds  = dict(zip(full_problem["names"], full_problem["bounds"]))
+
+    active = info["active_params"]
+    return {
+        "num_vars": len(active),
+        "names":    active,
+        "bounds":   [full_bounds[p] for p in active],
+    }
+
+
+def expand_params_with_inactive(
+    reduced_params: Dict[str, float],
+    active_params_json: str,
+) -> Dict[str, float]:
+    """
+    Given a dict of active-parameter values (from the reduced Sobol sample),
+    fill in all inactive parameters at their nominal multiplier = 1.0 so that
+    compute_reliability() receives the full 563-parameter dict it expects.
+
+    Usage (from your Sobol evaluation loop):
+        from morris_screening import expand_params_with_inactive
+        full_params = expand_params_with_inactive(reduced_row, json_path)
+        full_params["wind_scale"] = weibull_scale_from_mean(...)
+        lolp, eens, ... = compute_reliability(full_params, ...)
+    """
+    with open(active_params_json) as f:
+        info = json.load(f)
+
+    full_params = {p: 1.0 for p in info["inactive_params"]}
+    full_params.update(reduced_params)
+    return full_params
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MAIN
+# ══════════════════════════════════════════════════════════════════════════════
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Morris screening for RTS-96 563D cyber-physical reliability model",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    parser.add_argument("--trajectories", type=int, default=20,
+                        help="Number of Morris trajectories r. Cost = r × (D+1). Default: 20.")
+    parser.add_argument("--inner-trials", type=int, default=50,
+                        help="Inner MC trials per contingency. Default: 50.")
+    parser.add_argument("--max-outages", type=int, default=1,
+                        help="Max outage order. Default: 1.")
+    parser.add_argument("--enum-top-lines", type=int, default=8,
+                        help="Top lines to enumerate. Default: 8.")
+    parser.add_argument("--n-jobs", type=int, default=1,
+                        help="Parallel workers. Set to CPU count on ACCRE. Default: 1.")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Base random seed. Default: 42.")
+    parser.add_argument("--num-levels", type=int, default=4,
+                        help="Number of levels in Morris grid. Default: 4.")
+    parser.add_argument("--threshold-percentile", type=float, default=75.0,
+                        help="μ* percentile cutoff to classify a param as active. Default: 75.")
+    parser.add_argument("--output-dir", type=str, default="morris_output",
+                        help="Directory for all output files. Default: morris_output/")
+
+    args = parser.parse_args()
+
+    run_morris(
+        n_trajectories=args.trajectories,
+        inner_trials=args.inner_trials,
+        max_outages=args.max_outages,
+        enum_top_lines=args.enum_top_lines,
+        n_jobs=args.n_jobs,
+        seed=args.seed,
+        num_levels=args.num_levels,
+        threshold_percentile=args.threshold_percentile,
+        output_dir=args.output_dir,
+    )
+
+
+if __name__ == "__main__":
+    main()

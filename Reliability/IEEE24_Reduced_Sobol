@@ -1,0 +1,211 @@
+"""
+run_reduced_sobol.py
+=====================
+Run Sobol sensitivity analysis using ONLY the parameters identified as
+important by Morris screening.  Inactive parameters are held at their
+nominal multiplier (1.0).
+
+This is the second step in the two-step workflow:
+
+    STEP 1 — Morris screening (cheap):
+        python morris_screening.py --trajectories 20 --inner-trials 50
+
+    STEP 2 — Reduced Sobol (fast because D is small):
+        python run_reduced_sobol.py --active-params morris_output/morris_active_params.json \
+               --n-samples 512 --inner-trials 50 --enum-top-lines 8
+
+WHY THIS IS MUCH FASTER
+------------------------
+Full Sobol:    D = 563  →  N × (563 + 2) = N × 565 evaluations
+Reduced Sobol: D ≈ 50   →  N × (50  + 2) = N × 52  evaluations   ← ~11× cheaper
+
+At N = 512:
+  Full:    512 × 565 = 289,280 evaluations  (~4-5 days on ACCRE)
+  Reduced: 512 × 52  =  26,624 evaluations  (~5-6 hours on ACCRE)
+
+And confidence intervals improve proportionally — the same N gives
+tighter CI on the reduced problem because there is less "noise budget"
+spread across fewer parameters.
+"""
+
+import argparse
+import json
+import os
+
+import numpy as np
+import pandas as pd
+from SALib.sample import saltelli
+from SALib.analyze import sobol as sobol_analyze
+
+from full_component_sobol import (
+    build_sobol_problem,
+    compute_reliability,
+    weibull_scale_from_mean,
+    stable_seed,
+)
+from morris_screening import (
+    build_reduced_sobol_problem,
+    expand_params_with_inactive,
+)
+
+
+def run_reduced_sobol(
+    active_params_json: str,
+    n_samples: int,
+    inner_trials: int,
+    max_outages: int,
+    enum_top_lines: int,
+    n_jobs: int,
+    seed: int,
+    output_dir: str,
+):
+    os.makedirs(output_dir, exist_ok=True)
+
+    # ── Load Morris results and build reduced problem ─────────────────────────
+    with open(active_params_json) as f:
+        morris_info = json.load(f)
+
+    problem = build_reduced_sobol_problem(active_params_json)
+    D_reduced = problem["num_vars"]
+    n_eval = n_samples * (D_reduced + 2)
+
+    print("=" * 70)
+    print("Reduced Sobol Sensitivity — RTS-96 CPPS")
+    print("=" * 70)
+    print(f"  Active parameters (D) : {D_reduced}")
+    print(f"  Sobol base N          : {n_samples}")
+    print(f"  Total evaluations     : {n_eval}")
+    print(f"  Inner MC trials       : {inner_trials}")
+    print(f"  Enum top lines        : {enum_top_lines}")
+    print("=" * 70)
+
+    # ── Sample ────────────────────────────────────────────────────────────────
+    print("\nGenerating Saltelli samples...")
+    param_values = saltelli.sample(problem, n_samples, calc_second_order=False)
+
+    Y_lolp = np.zeros(n_eval)
+    Y_eens = np.zeros(n_eval)
+
+    # ── Evaluate ──────────────────────────────────────────────────────────────
+    if n_jobs == 1:
+        for i, row in enumerate(param_values):
+            reduced = {name: float(row[j]) for j, name in enumerate(problem["names"])}
+            # Fill inactive params at 1.0
+            full_params = expand_params_with_inactive(reduced, active_params_json)
+            full_params["wind_scale"] = weibull_scale_from_mean(
+                full_params["wind_mean"], full_params["wind_k"]
+            )
+            s = stable_seed(seed, "reduced_sobol", i)
+            lolp, eens, *_ = compute_reliability(
+                params=full_params,
+                max_outages=max_outages,
+                enum_top_lines=enum_top_lines,
+                inner_trials=inner_trials,
+                seed=s,
+            )
+            Y_lolp[i] = lolp
+            Y_eens[i] = eens
+            if (i + 1) % 50 == 0 or i + 1 == n_eval:
+                print(f"  {i+1}/{n_eval} evaluations done")
+    else:
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+
+        def _eval(args):
+            i, row, pnames, active_json, mo, etl, it, base_seed = args
+            reduced = {name: float(row[j]) for j, name in enumerate(pnames)}
+            full_params = expand_params_with_inactive(reduced, active_json)
+            full_params["wind_scale"] = weibull_scale_from_mean(
+                full_params["wind_mean"], full_params["wind_k"]
+            )
+            s = stable_seed(base_seed, "reduced_sobol", i)
+            lolp, eens, *_ = compute_reliability(full_params, mo, etl, it, s)
+            return i, float(lolp), float(eens)
+
+        tasks = [
+            (i, param_values[i], problem["names"], active_params_json,
+             max_outages, enum_top_lines, inner_trials, seed)
+            for i in range(n_eval)
+        ]
+        completed = 0
+        with ProcessPoolExecutor(max_workers=n_jobs) as ex:
+            futs = {ex.submit(_eval, t): t[0] for t in tasks}
+            for fut in as_completed(futs):
+                idx, lolp, eens = fut.result()
+                Y_lolp[idx] = lolp
+                Y_eens[idx] = eens
+                completed += 1
+                if completed % 100 == 0 or completed == n_eval:
+                    print(f"  {completed}/{n_eval} done")
+
+    # ── Sobol analysis ────────────────────────────────────────────────────────
+    print("\nComputing Sobol indices...")
+    Si_lolp = sobol_analyze.analyze(problem, Y_lolp, calc_second_order=False, print_to_console=False)
+    Si_eens = sobol_analyze.analyze(problem, Y_eens, calc_second_order=False, print_to_console=False)
+
+    # ── Save results ──────────────────────────────────────────────────────────
+    summary = pd.DataFrame({
+        "parameter":    problem["names"],
+        "S1_LOLP":      Si_lolp["S1"],
+        "S1_conf_LOLP": Si_lolp["S1_conf"],
+        "ST_LOLP":      Si_lolp["ST"],
+        "ST_conf_LOLP": Si_lolp["ST_conf"],
+        "S1_EENS":      Si_eens["S1"],
+        "S1_conf_EENS": Si_eens["S1_conf"],
+        "ST_EENS":      Si_eens["ST"],
+        "ST_conf_EENS": Si_eens["ST_conf"],
+    })
+    summary = summary.sort_values("ST_LOLP", ascending=False).reset_index(drop=True)
+    out_csv = os.path.join(output_dir, "reduced_sobol_indices.csv")
+    summary.to_csv(out_csv, index=False)
+    print(f"\nSaved: {out_csv}")
+
+    # Print top 15
+    print("\n" + "─" * 70)
+    print("TOP 15 — LOLP (by ST)")
+    print("─" * 70)
+    print(f"{'Parameter':<28}  {'S1':>8}  {'ST':>8}  {'CI(ST)':>8}")
+    for _, r in summary.head(15).iterrows():
+        print(f"{r.parameter:<28}  {r.S1_LOLP:>8.4f}  {r.ST_LOLP:>8.4f}  ±{r.ST_conf_LOLP:>6.4f}")
+
+    print("\n" + "─" * 70)
+    top_eens = summary.sort_values("ST_EENS", ascending=False).head(15)
+    print("TOP 15 — EENS (by ST)")
+    print("─" * 70)
+    print(f"{'Parameter':<28}  {'S1':>8}  {'ST':>8}  {'CI(ST)':>8}")
+    for _, r in top_eens.iterrows():
+        print(f"{r.parameter:<28}  {r.S1_EENS:>8.4f}  {r.ST_EENS:>8.4f}  ±{r.ST_conf_EENS:>6.4f}")
+
+    ci_lolp = float(np.mean(Si_lolp["ST_conf"]))
+    ci_eens = float(np.mean(Si_eens["ST_conf"]))
+    print(f"\n  Mean CI (LOLP ST) : ±{ci_lolp:.4f}")
+    print(f"  Mean CI (EENS ST) : ±{ci_eens:.4f}")
+    print(f"  Target CI < 0.10  : {'✓ ACHIEVED' if max(ci_lolp, ci_eens) < 0.10 else '✗ need more samples'}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Reduced-dimension Sobol after Morris screening")
+    parser.add_argument("--active-params", required=True,
+                        help="Path to morris_active_params.json from Morris screening step")
+    parser.add_argument("--n-samples", type=int, default=512)
+    parser.add_argument("--inner-trials", type=int, default=50)
+    parser.add_argument("--max-outages", type=int, default=1)
+    parser.add_argument("--enum-top-lines", type=int, default=8)
+    parser.add_argument("--n-jobs", type=int, default=1)
+    parser.add_argument("--seed", type=int, default=123)
+    parser.add_argument("--output-dir", type=str, default="reduced_sobol_output")
+    args = parser.parse_args()
+
+    run_reduced_sobol(
+        active_params_json=args.active_params,
+        n_samples=args.n_samples,
+        inner_trials=args.inner_trials,
+        max_outages=args.max_outages,
+        enum_top_lines=args.enum_top_lines,
+        n_jobs=args.n_jobs,
+        seed=args.seed,
+        output_dir=args.output_dir,
+    )
+
+
+if __name__ == "__main__":
+    main()
