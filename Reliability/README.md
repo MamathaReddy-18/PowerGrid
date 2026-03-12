@@ -857,3 +857,9 @@ Sensitivity analysis methodology follows:
 RTS-96 test system data from:
 
 > IEEE Task Force on Test Systems for Economic Analysis (1996). "The IEEE Reliability Test System-1996."
+
+## Reference for Sobol and Morris:
+
+> https://salib.readthedocs.io/en/latest/
+
+> https://gsa-module.readthedocs.io/en/stable/implementation/morris_screening_method.html
