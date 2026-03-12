@@ -1,7 +1,7 @@
 # RTS-96 Cyber-Physical Power System — Reliability & Global Sensitivity Analysis
 
 **Vanderbilt University · Power Systems Cybersecurity Research · March 2026**  
-**Author:** Priyanka (Mamatha Reddy Tamilisetti)
+**Author:** (Mamatha Reddy Tamilisetti)
 
 ---
 
@@ -860,7 +860,3 @@ Sensitivity analysis methodology follows:
 RTS-96 test system data from:
 
 > IEEE Task Force on Test Systems for Economic Analysis (1996). "The IEEE Reliability Test System-1996."
-
----
-
-*Vanderbilt University · Power Systems Cybersecurity Research · March 2026*
