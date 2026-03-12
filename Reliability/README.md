@@ -1,8 +1,5 @@
 # RTS-96 Cyber-Physical Power System — Reliability & Global Sensitivity Analysis
 
-**Vanderbilt University · Power Systems Cybersecurity Research · March 2026**  
-**Author:** (Mamatha Reddy Tamilisetti)
-
 ---
 
 ## Overview
