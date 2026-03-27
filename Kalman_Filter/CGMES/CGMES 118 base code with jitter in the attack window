@@ -1,0 +1,1019 @@
+#CGMES 118 base code with jitter in the attack window
+
+
+# =============================================================================
+# FDIA Detection with UKF + Multi-Sim + IF & HGB
+# Realistic, researcher-friendly implementation
+#
+# Sections
+# A. Overview & knobs (what to tweak)
+# B. Imports
+# C. CSV & CGMES loading + validation
+# D. Power flow (PF) utilities
+# E. UKF state utilities (packing, wrapping, residuals)
+# F. Jacobian blocks & linear sensitivities G
+# G. PMU selection & attack helpers
+# H. Single-simulation runner (returns per-timestep features)
+# I. Multi-simulation harness + IsolationForest training         [CHANGE]
+# I2. Supervised detector (HistGradientBoosting)                 [CHANGE]
+# J. Plotting (χ², IF, HGB) + helpers                           [CHANGE]
+# J2. Substation trace (|V| & θ)                                [CHANGE]
+# K. __main__ (wire everything together)
+# =============================================================================
+
+# =============================================================================
+# A) OVERVIEW & KNOBS
+# =============================================================================
+from pathlib import Path
+
+# --- (Paths) ---
+CSV_PATH      = Path("cgmes_smallgrid_timeseries_with_gens.csv")  # put next to script or give absolute path
+BOUNDARY_ZIP  = Path(r"C:\Users\mamat\Downloads\CGMES_v2.4.15_SmallGridTestConfiguration_Boundary_v3.0.0.zip")
+BASECASE_ZIP  = Path(r"C:\Users\mamat\Downloads\CGMES_v2.4.15_SmallGridTestConfiguration_BaseCase_Complete_v3.0.0.zip")
+
+# --- (Experiment/time) ---
+DT = 1.0
+MAX_SECONDS = 60               # cap per run
+BASE_SEED = 7
+N_SIMS = 5                   # [CHANGE] multi-sim count
+
+# --- (FDIA) ---
+ATTACK_WINDOW_BASE = (20, 40)  # inclusive start, exclusive end (for baseline plot lines)
+ANGLE_SHIFT_DEG_FINAL = 5.0
+V_SCALE = 1.015
+
+# --- (Detection) ---
+PRETRAIN_END = 18
+DET_PERC_GLOBAL = 96.5         # baseline percentile for χ² and thresholds
+DEBOUNCE_GAP = 3
+
+# --- (PMU noise) ---
+PMU_SIGMA_VMAG_PU   = 0.002
+PMU_SIGMA_VANG_DEG  = 0.05
+
+# --- (UKF hyperparams) ---
+ALPHA, BETA, KAPPA = 0.05, 2.0, 0.0
+Q_ANGLE_RAD = 0.0005
+Q_VMAG_PU   = 0.0005
+P0_ANGLE_RAD = 0.01
+P0_VMAG_PU   = 0.003
+VSET_MIN, VSET_MAX = 0.94, 1.08
+VM_CLIP = (0.8, 1.2)
+
+# =============================================================================
+# B) IMPORTS
+# =============================================================================
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+import pandapower as pp
+from pandapower.converter import from_cim as cim2pp
+import pandapower.topology as top
+from pandapower.pypower.dSbus_dV import dSbus_dV
+
+from filterpy.kalman import UnscentedKalmanFilter as UKF
+from filterpy.kalman import MerweScaledSigmaPoints
+
+# ML
+from sklearn.ensemble import IsolationForest            # [CHANGE]
+from sklearn.ensemble import HistGradientBoostingClassifier  # [CHANGE]
+
+
+# =============================================================================
+# C) CSV & CGMES LOADING + VALIDATION
+# =============================================================================
+def validate_and_load_csv(path: Path, max_seconds: int) -> tuple[pd.DataFrame, list[str], list[str], list[str], list[str], bool]:
+    if not path.is_file():
+        raise FileNotFoundError(f"CSV not found: {path}")
+
+    df = pd.read_csv(path)
+    if "time_s" not in df.columns:
+        raise ValueError("CSV must contain column 'time_s'.")
+    df = df.sort_values("time_s").reset_index(drop=True)
+    df = df[df["time_s"] < df["time_s"].iloc[0] + max_seconds].reset_index(drop=True)
+
+    load_p_cols = sorted([c for c in df.columns if c.startswith("P_MW_bus")], key=lambda s: int(s.split("bus")[-1]))
+    load_q_cols = sorted([c for c in df.columns if c.startswith("Q_MVAr_bus")], key=lambda s: int(s.split("bus")[-1]))
+    gen_p_cols  = sorted([c for c in df.columns if c.startswith("Pgen_MW_bus")], key=lambda s: int(s.split("bus")[-1]))
+    vset_cols   = sorted([c for c in df.columns if c.startswith("Vset_pu_bus")], key=lambda s: int(s.split("bus")[-1]))
+    has_slack   = "Vset_pu_slack" in df.columns
+
+    p_b = {int(c.split("bus")[-1]) for c in load_p_cols}
+    q_b = {int(c.split("bus")[-1]) for c in load_q_cols}
+    if p_b != q_b:
+        missing_p = q_b - p_b
+        missing_q = p_b - q_b
+        if missing_p:
+            raise ValueError(f"CSV Q_MVAr buses {sorted(missing_p)} have no matching P_MW entries.")
+        if missing_q:
+            raise ValueError(f"CSV P_MW buses {sorted(missing_q)} have no matching Q_MVAr entries.")
+
+    # Sanity on values: NaNs → error (we prefer explicit inputs)
+    if df[load_p_cols + load_q_cols].isna().any().any():
+        raise ValueError("CSV has NaNs in P/Q load columns.")
+    if gen_p_cols and df[gen_p_cols].isna().any().any():
+        raise ValueError("CSV has NaNs in generator P columns.")
+    return df, load_p_cols, load_q_cols, gen_p_cols, vset_cols, has_slack
+
+
+def load_cgmes(boundary_zip: Path, basecase_zip: Path):
+    for f in (boundary_zip, basecase_zip):
+        if not f.is_file():
+            raise FileNotFoundError(
+                f"Missing CGMES file: {f}\n"
+                "Please adjust BOUNDARY_ZIP/BASECASE_ZIP to point to your CGMES zips."
+            )
+    net = cim2pp.from_cim(
+        file_list=[str(boundary_zip), str(basecase_zip)],
+        cgmes_version="2.4.15",
+        use_GL_or_DL_profile="DL",
+        run_powerflow=False,
+    )
+    pp.runpp(net, calculate_voltage_angles=True)
+    return net
+
+
+# =============================================================================
+# D) POWER FLOW (PF) UTILITIES
+# =============================================================================
+try:
+    from pandapower.powerflow import LoadflowNotConverged
+except Exception:
+    class LoadflowNotConverged(RuntimeError): pass
+
+def set_total_bus_load(net, bus_idx: int, P_MW: float, Q_MVAr: float):
+    load_rows = net.load.index[net.load.bus.values == bus_idx]
+    if len(load_rows) == 0:
+        pp.create_load(net, bus=bus_idx, p_mw=float(max(P_MW, 0.0)), q_mvar=float(max(Q_MVAr, 0.0)))
+        return
+    P0 = float(net.load.loc[load_rows, "p_mw"].sum())
+    Q0 = float(net.load.loc[load_rows, "q_mvar"].sum())
+    if P0 <= 1e-9:
+        share = np.ones(len(load_rows)) / len(load_rows)
+        net.load.loc[load_rows, "p_mw"] = float(max(P_MW, 0.0)) * share
+    else:
+        net.load.loc[load_rows, "p_mw"] *= float(max(P_MW, 0.0)) / P0
+    if Q0 <= 1e-9:
+        share = np.ones(len(load_rows)) / len(load_rows)
+        net.load.loc[load_rows, "q_mvar"] = float(max(Q_MVAr, 0.0)) * share
+    else:
+        net.load.loc[load_rows, "q_mvar"] *= float(max(Q_MVAr, 0.0)) / Q0
+
+def set_bus_generators_active_power(net, bus_idx: int, Pgen_MW: float):
+    gen_rows = net.gen.index[net.gen.bus.values == bus_idx]
+    if len(gen_rows) == 0: return
+    P0 = float(net.gen.loc[gen_rows, "p_mw"].sum())
+    if P0 <= 1e-9:
+        share = np.ones(len(gen_rows)) / len(gen_rows)
+        net.gen.loc[gen_rows, "p_mw"] = float(max(Pgen_MW, 0.0)) * share
+    else:
+        net.gen.loc[gen_rows, "p_mw"] *= float(max(Pgen_MW, 0.0)) / P0
+
+def set_bus_vset(net, bus_idx: int, Vset_pu: float):
+    Vset_pu = float(np.clip(Vset_pu, VSET_MIN, VSET_MAX))
+    gen_rows = net.gen.index[net.gen.bus.values == bus_idx]
+    if len(gen_rows) == 0: return
+    net.gen.loc[gen_rows, "vm_pu"] = Vset_pu
+
+def set_slack_vset(net, Vset_pu: float):
+    Vset_pu = float(np.clip(Vset_pu, VSET_MIN, VSET_MAX))
+    if len(net.ext_grid): net.ext_grid.loc[net.ext_grid.index, "vm_pu"] = Vset_pu
+
+def try_runpp(net) -> bool:
+    attempts = [
+        dict(algorithm="nr",          init="results"),
+        dict(algorithm="iwamoto_nr",  init="results"),
+        dict(algorithm="nr",          init="flat"),
+        dict(algorithm="iwamoto_nr",  init="flat"),
+        dict(algorithm="bfsw",        init="flat"),
+    ]
+    common = dict(
+        calculate_voltage_angles=True,
+        enforce_q_lims=True,
+        distributed_slack=False,
+        voltage_depend_loads=True,
+        check_connectivity=True,
+        max_iteration=60,
+        tolerance_mva=1e-6,
+    )
+    for opt in attempts:
+        try:
+            pp.runpp(net, **common, **opt)
+            return True
+        except LoadflowNotConverged:
+            continue
+        except (TypeError, ValueError, NotImplementedError):
+            continue
+    return False
+
+def capture_current_inputs(net):
+    NB = net.bus.shape[0]
+    loads = {}
+    for b in range(NB):
+        mask = (net.load.bus.values == b)
+        if mask.any():
+            loads[b] = (float(net.load.loc[net.load.index[mask], "p_mw"].sum()),
+                        float(net.load.loc[net.load.index[mask], "q_mvar"].sum()))
+        else:
+            loads[b] = (0.0, 0.0)
+    gensP = {}
+    for b in range(NB):
+        mask = (net.gen.bus.values == b) if len(net.gen) else []
+        gensP[b] = float(net.gen.loc[net.gen.index[mask], "p_mw"].sum()) if (len(net.gen) and mask.any()) else 0.0
+    vset = {}
+    for b in range(NB):
+        mask = (net.gen.bus.values == b) if len(net.gen) else []
+        vset[b] = float(net.gen.loc[net.gen.index[mask], "vm_pu"].mean()) if (len(net.gen) and mask.any()) else np.nan
+    slackV = float(net.ext_grid.vm_pu.mean()) if len(net.ext_grid) else np.nan
+    return loads, gensP, vset, slackV
+
+def apply_inputs_from_dicts(net, loads_t, gensP_t, vset_t, slackV_t):
+    NB = net.bus.shape[0]
+    for b in range(NB):
+        P, Q = loads_t.get(b, (np.nan, np.nan))
+        if not (np.isnan(P) or np.isnan(Q)): set_total_bus_load(net, b, P, Q)
+    for b in range(NB):
+        Pg = gensP_t.get(b, np.nan)
+        if not np.isnan(Pg): set_bus_generators_active_power(net, b, Pg)
+    for b in range(NB):
+        V = vset_t.get(b, np.nan)
+        if not np.isnan(V): set_bus_vset(net, b, V)
+    if not np.isnan(slackV_t): set_slack_vset(net, slackV_t)
+
+def robust_apply_and_solve(net, target_loads, target_gensP, target_vset, target_slackV,
+                           prev_loads, prev_gensP, prev_vset, prev_slackV):
+    NB = net.bus.shape[0]
+    schedule = [1.0, 0.7, 0.5, 0.3, 0.15, 0.08]
+    for lam in schedule:
+        loads_try  = {b: (prev_loads[b][0] + lam*(target_loads[b][0]-prev_loads[b][0]),
+                          prev_loads[b][1] + lam*(target_loads[b][1]-prev_loads[b][1])) for b in range(NB)}
+        gensP_try  = {b: prev_gensP[b] + lam*(target_gensP[b]-prev_gensP[b]) for b in range(NB)}
+        vset_try   = {b: (prev_vset[b] if np.isnan(target_vset[b]) else
+                          prev_vset[b] + lam*(target_vset[b]-prev_vset[b])) for b in range(NB)}
+        slackV_try = prev_slackV if np.isnan(target_slackV) else prev_slackV + lam*(target_slackV-prev_slackV)
+        apply_inputs_from_dicts(net, loads_try, gensP_try, vset_try, slackV_try)
+        if try_runpp(net): return loads_try, gensP_try, vset_try, slackV_try, True
+
+    for rf in [0.95, 0.9, 0.85]:
+        loads_try  = {b: (target_loads[b][0]*rf, target_loads[b][1]*rf) for b in range(NB)}
+        gensP_try  = target_gensP.copy()
+        vset_try   = target_vset.copy()
+        slackV_try = target_slackV
+        apply_inputs_from_dicts(net, loads_try, gensP_try, vset_try, slackV_try)
+        if try_runpp(net): return loads_try, gensP_try, vset_try, slackV_try, True
+
+    return prev_loads, prev_gensP, prev_vset, prev_slackV, False
+
+
+# =============================================================================
+# E) UKF STATE UTILITIES (PACKING, WRAPPING, RESIDUALS)
+# =============================================================================
+def wrap_angle(a_rad): 
+    return (a_rad + np.pi) % (2*np.pi) - np.pi
+
+def state_pack_from_pf(vm, va_deg, NB, slack_bus):
+    va = np.deg2rad(va_deg)
+    x = np.zeros((NB - 1) + NB, dtype=float)
+    if slack_bus == 0: x[:NB-1] = va[1:]
+    else:
+        x[:slack_bus] = va[:slack_bus]
+        x[slack_bus:NB-1] = va[slack_bus+1:]
+    x[NB-1:] = vm
+    return x
+
+def state_unpack(x, NB, slack_bus):
+    theta = np.zeros(NB, dtype=float)
+    if slack_bus == 0: theta[1:] = x[:NB-1]
+    else:
+        theta[:slack_bus] = x[:slack_bus]
+        theta[slack_bus+1:] = x[slack_bus:NB-1]
+    vm = x[NB-1:]
+    return theta, vm
+
+def state_mean_fn_factory(angle_idx):
+    def mean_fn(sigmas, Wm):
+        out = np.zeros(sigmas.shape[1])
+        s = np.sin(sigmas[:, angle_idx]); c = np.cos(sigmas[:, angle_idx])
+        out[angle_idx] = np.arctan2(np.dot(Wm, s), np.dot(Wm, c))
+        for j in range(sigmas.shape[1]):
+            if j not in angle_idx: out[j] = np.dot(Wm, sigmas[:, j])
+        return out
+    return mean_fn
+
+def residual_fn_factory(angle_idx):
+    def residual(a, b):
+        y = a - b
+        y[angle_idx] = (y[angle_idx] + np.pi) % (2*np.pi) - np.pi
+        return y
+    return residual
+
+def clip_and_wrap_state(x, NB, slack_bus):
+    theta, vm = state_unpack(x, NB, slack_bus)
+    theta = wrap_angle(theta)
+    vm = np.clip(vm, VM_CLIP[0], VM_CLIP[1])
+    if slack_bus == 0:
+        x[:NB-1] = theta[1:]
+    else:
+        x[:slack_bus] = theta[:slack_bus]
+        x[slack_bus:NB-1] = theta[slack_bus+1:]
+    x[NB-1:] = vm
+    return x
+
+def nearest_spd(P, floor=1e-8):
+    P = 0.5 * (P + P.T)
+    vals, vecs = np.linalg.eigh(P)
+    vals = np.maximum(vals, floor)
+    return (vecs @ np.diag(vals) @ vecs.T).astype(float, copy=False)
+
+
+# =============================================================================
+# F) JACOBIAN BLOCKS & LINEAR SENSITIVITIES G
+# =============================================================================
+def to_dense_float(mat):
+    if hasattr(mat, "toarray"): return mat.toarray().astype(float, copy=False)
+    if hasattr(mat, "A"):       return np.asarray(mat.A, dtype=float)
+    return np.asarray(mat, dtype=float)
+
+def get_bus_sets(net):
+    NB = net.bus.shape[0]
+    slack = int(net.ext_grid.bus.iloc[0]) if len(net.ext_grid) else 0
+    pv = sorted({int(b) for b in net.gen.bus.values}) if len(net.gen) else []
+    pq = sorted(set(range(NB)) - {slack} - set(pv))
+    non_slack = sorted(set(range(NB)) - {slack})
+    return slack, pv, pq, non_slack
+
+def build_jacobian_blocks(net):
+    vm = net.res_bus.vm_pu.values.astype(float)
+    va = np.deg2rad(net.res_bus.va_degree.values.astype(float))
+    V  = vm * np.exp(1j * va)
+    Ybus = net._ppc["internal"]["Ybus"]
+    dS_dVa, dS_dVm = dSbus_dV(Ybus, V)
+    H = to_dense_float(dS_dVa.real)   # ∂P/∂θ
+    Nmat = to_dense_float(dS_dVm.real)# ∂P/∂|V|
+    M = to_dense_float(dS_dVa.imag)   # ∂Q/∂θ
+    L = to_dense_float(dS_dVm.imag)   # ∂Q/∂|V|
+    return H, Nmat, M, L
+
+def build_G(net, input_indexers, Sbase):
+    slack, pv, pq, non_slack = get_bus_sets(net)
+    H, Nmat, M, L = build_jacobian_blocks(net)
+    NB = net.bus.shape[0]
+
+    rowsP = np.array(non_slack, dtype=int)
+    rowsQ = np.array(pq, dtype=int)
+    colsAng   = np.array(non_slack, dtype=int)
+    colsVmPQ  = np.array(pq, dtype=int)
+    colsVmCtr = np.array(sorted(set(pv + [slack])), dtype=int)
+
+    A = H[np.ix_(rowsP, colsAng)]
+    B = Nmat[np.ix_(rowsP, colsVmPQ)]
+    C = M[np.ix_(rowsQ, colsAng)]
+    D = L[np.ix_(rowsQ, colsVmPQ)]
+    Jred = np.block([[A, B],[C, D]]).astype(float, copy=False)
+
+    N_ctrl = Nmat[np.ix_(rowsP, colsVmCtr)]
+    L_ctrl = L[np.ix_(rowsQ, colsVmCtr)]
+
+    dim_x = (NB - 1) + NB
+    G = np.zeros((dim_x, len(input_indexers)), dtype=float)
+
+    for j, (name, kind, bidx) in enumerate(input_indexers):
+        DP = np.zeros(NB, dtype=float)
+        DQ = np.zeros(NB, dtype=float)
+        DVm_ctrl = np.zeros(NB, dtype=float)
+
+        if kind == "loadP": DP[bidx] += -1.0 / Sbase
+        elif kind == "loadQ": DQ[bidx] += -1.0 / Sbase
+        elif kind == "genP": DP[bidx] += +1.0 / Sbase
+        elif kind == "vset" and bidx in colsVmCtr: DVm_ctrl[bidx] = +1.0
+        elif kind == "slackV": DVm_ctrl[slack] = +1.0
+
+        bP = DP[rowsP] - N_ctrl.dot(DVm_ctrl[colsVmCtr])
+        bQ = DQ[rowsQ] - L_ctrl.dot(DVm_ctrl[colsVmCtr])
+        rhs = np.r_[bP, bQ]
+
+        try:
+            dvars = np.linalg.solve(Jred, rhs)
+        except np.linalg.LinAlgError:
+            dvars, *_ = np.linalg.lstsq(Jred, rhs, rcond=1e-12)
+
+        dth_ns = dvars[:len(colsAng)]
+        dVm_PQ = dvars[len(colsAng):]
+
+        dtheta = np.zeros(NB, dtype=float); dtheta[colsAng] = dth_ns; dtheta[slack] = 0.0
+        dVm_all = np.zeros(NB, dtype=float); dVm_all[colsVmPQ] = dVm_PQ; dVm_all[colsVmCtr] = DVm_ctrl[colsVmCtr]
+
+        dx = np.zeros(dim_x, dtype=float)
+        if slack == 0:
+            dx[:NB-1] = dtheta[1:]
+        else:
+            dx[:slack] = dtheta[:slack]
+            dx[slack:NB-1] = dtheta[slack+1:]
+        dx[NB-1:] = dVm_all
+        G[:, j] = dx
+    return G
+
+
+# =============================================================================
+# G) PMU SELECTION & ATTACK HELPERS
+# =============================================================================
+def choose_pmu_buses(net):
+    Gg = top.create_nxgraph(net, respect_switches=True)
+    deg = dict(Gg.degree())
+    groups = {}
+    if len(net.trafo):
+        for hvb in net.trafo.hv_bus.values:
+            hvb = int(hvb)
+            neigh = set([hvb])
+            if hvb in Gg: neigh |= set(Gg.neighbors(hvb))
+            groups[hvb] = sorted(neigh)
+
+    if groups:
+        target_hv = max(groups, key=lambda b: deg.get(b, 0))
+        target_sub = groups[target_hv]
+    else:
+        target_hv = max(deg, key=deg.get)
+        target_sub = sorted(set([target_hv] + list(Gg.neighbors(target_hv))))
+
+    pmu_buses = set(int(b) for b in net.gen.bus.values.tolist()) if len(net.gen) else set()
+    pmu_buses |= set(target_sub)
+    pmu_buses = sorted(pmu_buses)
+    return pmu_buses, target_sub
+
+def in_any_attack_window(tt, windows):
+    for a, b in windows:
+        if a <= tt < b: return True, a, b
+    return False, None, None
+
+
+# =============================================================================
+# H) SINGLE-SIMULATION RUNNER (RETURNS PER-TIMESTEP FEATURES)
+# =============================================================================
+def build_input_indexers(load_p_cols, load_q_cols, gen_p_cols, vset_cols, has_slack, slack_bus):
+    indexers = []
+    for c in load_p_cols: indexers.append((c, "loadP", int(c.split("bus")[-1])))
+    for c in load_q_cols: indexers.append((c, "loadQ", int(c.split("bus")[-1])))
+    for c in gen_p_cols:  indexers.append((c, "genP",  int(c.split("bus")[-1])))
+    for c in vset_cols:   indexers.append((c, "vset",  int(c.split("bus")[-1])))
+    if has_slack:         indexers.append(("Vset_pu_slack", "slackV", slack_bus))
+    return indexers
+
+def run_single_sim(sim_id: int,
+                   df: pd.DataFrame,
+                   base_net,
+                   pmu_buses: list[int],
+                   main_sub: list[int],
+                   input_indexers,
+                   rng: np.random.Generator) -> pd.DataFrame:
+
+    net = base_net.deepcopy()
+    NB = net.bus.shape[0]
+    slack_bus = int(net.ext_grid.bus.iloc[0]) if len(net.ext_grid) else 0
+
+    # UKF setup
+    dim_x = (NB - 1) + NB
+    points = MerweScaledSigmaPoints(n=dim_x, alpha=ALPHA, beta=BETA, kappa=KAPPA)
+
+    pmu_idx = [int(b) for b in pmu_buses]
+    def hx(x):
+        th, vm = state_unpack(x, NB, slack_bus)
+        return np.concatenate([th[pmu_idx], vm[pmu_idx]])
+
+    nθ = len(pmu_idx); nV = len(pmu_idx); dim_z = nθ + nV
+
+    R = np.zeros((dim_z, dim_z))
+    sigma_ang_rad = np.deg2rad(PMU_SIGMA_VANG_DEG)
+    for k in range(nθ): R[k,k] = sigma_ang_rad**2
+    for k in range(nθ, nθ+nV): R[k,k] = PMU_SIGMA_VMAG_PU**2
+    R += 1e-10*np.eye(dim_z)
+
+    Qx = np.eye(dim_x)
+    for i in range(NB-1): Qx[i,i] = Q_ANGLE_RAD**2
+    for j in range(NB):   Qx[(NB-1)+j,(NB-1)+j] = Q_VMAG_PU**2
+    Qx += 5e-11*np.eye(dim_x)
+
+    P0 = np.eye(dim_x)
+    for i in range(NB-1): P0[i,i] = P0_ANGLE_RAD**2
+    for j in range(NB):   P0[(NB-1)+j,(NB-1)+j] = P0_VMAG_PU**2
+    P0 = nearest_spd(P0 + 1e-9*np.eye(dim_x), 1e-9)
+
+    G_t = np.zeros((dim_x, 1), dtype=float)
+    current_du = None
+    def fx_sens(x, dt):
+        x2 = x if current_du is None else (x + G_t.dot(current_du))
+        return clip_and_wrap_state(x2.copy(), NB, slack_bus)
+
+    ukf = UKF(dim_x=dim_x, dim_z=dim_z, fx=fx_sens, hx=hx, dt=DT, points=points)
+    ukf.x = clip_and_wrap_state(state_pack_from_pf(
+        net.res_bus.vm_pu.values.astype(float),
+        net.res_bus.va_degree.values.astype(float),
+        NB, slack_bus),
+        NB, slack_bus
+    )
+    ukf.P, ukf.Q, ukf.R = P0.copy(), Qx.copy(), R.copy()
+    angle_state_idx = np.arange(NB-1, dtype=int)
+    ukf.x_mean_fn = state_mean_fn_factory(angle_state_idx)
+    ukf.residual_x = residual_fn_factory(angle_state_idx)
+    ukf.residual_z = residual_fn_factory(np.arange(nθ, dtype=int))
+
+    # Controls
+    u_prev = None
+    prev_loads, prev_gensP, prev_vset, prev_slackV = capture_current_inputs(net)
+
+    # Attack window (per-sim jitter)
+    base_a, base_b = ATTACK_WINDOW_BASE
+    jitter = int(rng.integers(-5, 6))
+    a = max(10, base_a + jitter)
+    b = min(MAX_SECONDS - 1, a + (base_b - base_a) + 5)
+    attack_windows = [(a, b)]
+
+    rows = []
+    for _, row in df.iterrows():
+        t = int(row["time_s"])
+
+        # Targets from CSV
+        target_loads = {b:(0.0,0.0) for b in range(NB)}
+        for cP, cQ in zip([c for c in df.columns if c.startswith("P_MW_bus")],
+                          [c for c in df.columns if c.startswith("Q_MVAr_bus")]):
+            b = int(cP.split("bus")[-1])
+            target_loads[b] = (float(row[cP]), float(row[cQ]))
+        target_gensP = {b:prev_gensP[b] for b in range(NB)}
+        for cg in [c for c in df.columns if c.startswith("Pgen_MW_bus")]:
+            b = int(cg.split("bus")[-1]); target_gensP[b] = float(row[cg])
+        target_vset  = {b:np.nan for b in range(NB)}
+        for cv in [c for c in df.columns if c.startswith("Vset_pu_bus")]:
+            b = int(cv.split("bus")[-1]); target_vset[b] = float(np.clip(row[cv], VSET_MIN, VSET_MAX))
+        target_slackV = float(np.clip(row["Vset_pu_slack"], VSET_MIN, VSET_MAX)) if "Vset_pu_slack" in df.columns else np.nan
+
+        # Apply & PF
+        applied_loads, applied_gensP, applied_vset, applied_slackV, ok = robust_apply_and_solve(
+            net, target_loads, target_gensP, target_vset, target_slackV,
+            prev_loads, prev_gensP, prev_vset, prev_slackV
+        )
+        if ok:
+            prev_loads, prev_gensP, prev_vset, prev_slackV = applied_loads, applied_gensP, applied_vset, applied_slackV
+
+        # Refresh G at each step
+        G_t = build_G(net, input_indexers, Sbase=net.sn_mva)
+
+        # Build u_t and du
+        name2val = {}
+        for c in [c for c in df.columns if c.startswith("P_MW_bus")]:
+            b = int(c.split("bus")[-1]); name2val[c] = applied_loads[b][0]
+        for c in [c for c in df.columns if c.startswith("Q_MVAr_bus")]:
+            b = int(c.split("bus")[-1]); name2val[c] = applied_loads[b][1]
+        for c in [c for c in df.columns if c.startswith("Pgen_MW_bus")]:
+            b = int(c.split("bus")[-1]); name2val[c] = applied_gensP[b]
+        for c in [c for c in df.columns if c.startswith("Vset_pu_bus")]:
+            b = int(c.split("bus")[-1]); name2val[c] = applied_vset[b] if not np.isnan(applied_vset[b]) else np.nan
+        if "Vset_pu_slack" in df.columns: name2val["Vset_pu_slack"] = applied_slackV
+
+        u_t = np.zeros(len(input_indexers), dtype=float)
+        for j,(name,_,_) in enumerate(input_indexers):
+            u_t[j] = 0.0 if np.isnan(name2val.get(name, np.nan)) else float(name2val[name])
+        du_t = np.zeros_like(u_t) if (u_prev is None) else (u_t - u_prev)
+        u_prev = u_t.copy()
+        current_du = du_t.copy()
+
+        # True state
+        vm_true = net.res_bus.vm_pu.values.astype(float)
+        th_true = np.deg2rad(net.res_bus.va_degree.values.astype(float))
+
+        # Measurements (PMU noise)
+        m_vm = vm_true[pmu_idx].copy() + rng.normal(0.0, PMU_SIGMA_VMAG_PU, size=len(pmu_idx))
+        m_th = wrap_angle(th_true[pmu_idx] + rng.normal(0.0, np.deg2rad(PMU_SIGMA_VANG_DEG), size=len(pmu_idx)))
+
+        # FDIA (on main substation)
+        in_win, aa, bb = in_any_attack_window(t, attack_windows)
+        if in_win:
+            win_len = max(1, bb - aa); frac = (t - aa + 1) / win_len
+            drift_rad = np.deg2rad(ANGLE_SHIFT_DEG_FINAL * frac)
+            sub_mask = np.isin(pmu_idx, main_sub)
+            m_th[sub_mask] = wrap_angle(m_th[sub_mask] + drift_rad)
+            m_vm[sub_mask] = m_vm[sub_mask] * V_SCALE
+
+        z_t = np.concatenate([m_th, m_vm])
+
+        # UKF
+        ukf.P = nearest_spd(ukf.P, 1e-9)
+        ukf.predict()
+        ukf.x = clip_and_wrap_state(ukf.x, NB, slack_bus)
+        ukf.P = nearest_spd(ukf.P, 1e-9)
+        ukf.update(z_t)
+        ukf.x = clip_and_wrap_state(ukf.x, NB, slack_bus)
+        ukf.P = nearest_spd(ukf.P, 1e-9)
+
+        # χ²
+        y = np.asarray(ukf.y, dtype=float).reshape(-1)
+        S = nearest_spd(np.asarray(ukf.S, dtype=float), 1e-12) + 1e-12*np.eye(ukf.S.shape[0])
+        try:
+            chi = float(y.T @ np.linalg.inv(S) @ y)
+        except np.linalg.LinAlgError:
+            chi = float(y.T @ np.linalg.pinv(S, rcond=1e-10) @ y)
+
+        # Innovation stats used by ML
+        y_ang = y[:len(pmu_idx)]
+        y_mag = y[len(pmu_idx):]
+        feats = dict(
+            sim_id=sim_id, t=t, chi2=chi,
+            ang_abs_mean=float(np.abs(y_ang).mean()),
+            ang_abs_max=float(np.abs(y_ang).max()),
+            mag_abs_mean=float(np.abs(y_mag).mean()),
+            mag_abs_max=float(np.abs(y_mag).max()),
+            label=int(in_win)
+        )
+        rows.append(feats)
+
+    return pd.DataFrame(rows)
+
+
+# =============================================================================
+# I) MULTI-SIM HARNESS + ISOLATION FOREST TRAINING                      [CHANGE]
+# =============================================================================
+def train_isolation_forest(df_all: pd.DataFrame):
+    feat_cols = ["chi2", "ang_abs_mean", "ang_abs_max", "mag_abs_mean", "mag_abs_max"]
+    baseline_mask = df_all["t"] <= PRETRAIN_END
+    X_base = df_all.loc[baseline_mask, feat_cols].to_numpy()
+
+    model = IsolationForest(
+        n_estimators=300, max_samples="auto", contamination="auto", random_state=BASE_SEED
+    )
+    model.fit(X_base)
+
+    scores = model.score_samples(df_all[feat_cols].to_numpy())  # higher = more normal
+    df_all = df_all.copy()
+    df_all["if_score"] = scores
+
+    thr = np.percentile(scores[baseline_mask], 100 - DET_PERC_GLOBAL)
+    df_all["if_pred_attack"] = (scores < thr).astype(int)
+
+    # Simple metrics
+    y_true = df_all["label"].to_numpy()
+    y_pred = df_all["if_pred_attack"].to_numpy()
+    tp = int(((y_pred == 1) & (y_true == 1)).sum())
+    precision = tp / max(1, int((y_pred == 1).sum()))
+    recall    = tp / max(1, int((y_true == 1).sum()))
+    f1 = 0.0 if (precision+recall)==0 else 2*precision*recall/(precision+recall)
+
+    print(f"[IFOREST] Baseline threshold (p{100-DET_PERC_GLOBAL} of baseline) = {thr:.4f}")
+    print(f"[IFOREST] Precision={precision:.3f} Recall={recall:.3f} F1={f1:.3f}")
+
+    return model, thr, df_all
+
+
+# =============================================================================
+# I2) SUPERVISED DETECTOR (HistGradientBoosting)                         [CHANGE]
+# =============================================================================
+def train_histgb_classifier(df_all: pd.DataFrame):
+    feat_cols = ["chi2", "ang_abs_mean", "ang_abs_max", "mag_abs_mean", "mag_abs_max"]
+    sim_ids = np.sort(df_all["sim_id"].unique())
+    k = int(np.ceil(0.7*len(sim_ids)))
+    train_sims, test_sims = sim_ids[:k], sim_ids[k:]
+
+    train_mask = df_all["sim_id"].isin(train_sims)
+    test_mask  = df_all["sim_id"].isin(test_sims)
+
+    X_train = df_all.loc[train_mask, feat_cols].to_numpy()
+    y_train = df_all.loc[train_mask, "label"].astype(int).to_numpy()
+    X_test  = df_all.loc[test_mask, feat_cols].to_numpy() if test_mask.any() else None
+    y_test  = df_all.loc[test_mask, "label"].astype(int).to_numpy() if test_mask.any() else None
+
+    clf = HistGradientBoostingClassifier(
+        max_depth=3, learning_rate=0.12, max_iter=300,
+        min_samples_leaf=20, l2_regularization=1.0,
+        random_state=BASE_SEED,
+    )
+    clf.fit(X_train, y_train)
+
+    proba_train = clf.predict_proba(X_train)[:,1]
+    proba_all = np.zeros(len(df_all), dtype=float)
+    proba_all[train_mask] = proba_train
+    if test_mask.any():
+        proba_all[test_mask] = clf.predict_proba(X_test)[:,1]
+
+    base_mask_train = train_mask & (df_all["t"] <= PRETRAIN_END)
+    ml_thr = float(np.percentile(proba_all[base_mask_train], DET_PERC_GLOBAL)) if base_mask_train.any() else 0.5
+
+    df_all = df_all.copy()
+    df_all["hgb_proba"] = proba_all
+    df_all["hgb_pred_attack"] = (proba_all > ml_thr).astype(int)
+
+    if test_mask.any():
+        y_pred = df_all.loc[test_mask, "hgb_pred_attack"].to_numpy()
+        tp = int(((y_pred==1) & (y_test==1)).sum())
+        precision = tp / max(1, int((y_pred==1).sum()))
+        recall    = tp / max(1, int((y_test==1).sum()))
+        f1 = 0.0 if (precision+recall)==0 else 2*precision*recall/(precision+recall)
+        print(f"[HGB] Train sims={len(train_sims)} Test sims={len(test_sims)} | Thr={ml_thr:.3f}")
+        print(f"[HGB] Precision={precision:.3f} Recall={recall:.3f} F1={f1:.3f}")
+    else:
+        print(f"[HGB] Train sims={len(train_sims)} (no held-out sims). Thr={ml_thr:.3f}")
+
+    return clf, ml_thr, df_all
+
+
+# =============================================================================
+# J) PLOTTING (χ², IF, HGB) + HELPERS                                    [CHANGE]
+# =============================================================================
+_DEF_GAP = DEBOUNCE_GAP
+
+def _debounce(indices: list[int], gap: int = _DEF_GAP) -> list[int]:
+    out, last = [], -10**9
+    for t in sorted(indices):
+        if t - last >= gap:
+            out.append(t)
+            last = t
+    return out
+
+def _attack_windows_from_labels(dfx: pd.DataFrame) -> list[tuple[int,int]]:
+    wins, t, y = [], dfx["t"].to_numpy(), dfx["label"].to_numpy().astype(int)
+    if len(t) == 0: return wins
+    start = None
+    for i in range(len(t)):
+        if y[i] == 1 and start is None:
+            start = t[i]
+        if (y[i] == 0 and start is not None) or (i == len(t)-1 and start is not None):
+            end_t = t[i] if y[i] == 0 else (t[i] + 1)
+            wins.append((int(start), int(end_t)))
+            start = None
+    return wins
+
+def plot_panels(df_all: pd.DataFrame, sid: int, if_thr: float, hgb_thr: float | None = None):
+    dfx = df_all[df_all.sim_id == sid].copy()
+    t = dfx["t"].to_numpy()
+    wins = _attack_windows_from_labels(dfx)
+
+    fig, ax = plt.subplots(3, 1, figsize=(12,9), sharex=True)
+
+    # Panel 1: χ²
+    chi = dfx["chi2"].to_numpy()
+    base_mask = t <= PRETRAIN_END
+    chi_thr = float(np.percentile(chi[base_mask], DET_PERC_GLOBAL)) if base_mask.any() else np.nan
+    chi_dets = _debounce([int(tt) for tt, v in zip(t, chi) if (tt > PRETRAIN_END and np.isfinite(v) and v > chi_thr)], _DEF_GAP)
+
+    ax[0].plot(t, chi, lw=2.0, label="χ² residual energy")
+    for i,(a,b) in enumerate(wins): ax[0].axvspan(a, b, color="#5b9bd5", alpha=0.18, label="attack window" if i==0 else None)
+    if np.isfinite(chi_thr): ax[0].axhline(chi_thr, ls="--", lw=1.6, color="#1f77b4", alpha=0.8, label=f"χ² thr p{DET_PERC_GLOBAL}")
+    for i,tt in enumerate(chi_dets): ax[0].axvline(tt, color="#ff7f0e", lw=1.6, alpha=0.85, label="χ² detect" if i==0 else None)
+    ax[0].set_title("Global residual energy (Mahalanobis)")
+    ax[0].set_ylabel("χ²"); ax[0].grid(True, alpha=0.3); ax[0].legend()
+
+    # Panel 2: Isolation Forest
+    if "if_score" in dfx.columns:
+        if_score = dfx["if_score"].to_numpy()
+        if_dets = _debounce([int(tt) for tt, s in zip(t, if_score) if (tt > PRETRAIN_END and s < if_thr)], _DEF_GAP)
+        ax[1].plot(t, if_score, lw=2.0, label="IF score (higher=normal)")
+        for i,(a,b) in enumerate(wins): ax[1].axvspan(a, b, color="#5b9bd5", alpha=0.18, label="attack window" if i==0 else None)
+        ax[1].axhline(if_thr, ls="--", lw=1.6, color="#9467bd", alpha=0.9, label="IF threshold")
+        for i,tt in enumerate(if_dets): ax[1].axvline(tt, color="#8a2be2", lw=1.6, alpha=0.85, label="IF detect" if i==0 else None)
+        ax[1].set_ylabel("IF score"); ax[1].grid(True, alpha=0.3); ax[1].legend()
+    else:
+        ax[1].axis("off")
+
+    # Panel 3: HGB
+    if "hgb_proba" in dfx.columns:
+        hgb = dfx["hgb_proba"].to_numpy()
+        if hgb_thr is None:
+            hgb_thr = float(np.percentile(hgb[t <= PRETRAIN_END], DET_PERC_GLOBAL)) if (t <= PRETRAIN_END).any() else 0.5
+        hgb_dets = _debounce([int(tt) for tt, p in zip(t, hgb) if (tt > PRETRAIN_END and p > hgb_thr)], _DEF_GAP)
+        ax[2].plot(t, hgb, lw=2.0, label="HGB P(attack)")
+        for i,(a,b) in enumerate(wins): ax[2].axvspan(a, b, color="#5b9bd5", alpha=0.18, label="attack window" if i==0 else None)
+        ax[2].axhline(hgb_thr, ls="--", lw=1.6, color="#2ca02c", alpha=0.9, label="HGB threshold")
+        for i,tt in enumerate(hgb_dets): ax[2].axvline(tt, color="#2ca02c", lw=1.6, alpha=0.85, label="HGB detect" if i==0 else None)
+        ax[2].set_xlabel("Time step")
+        ax[2].set_ylabel("P(attack)"); ax[2].grid(True, alpha=0.3); ax[2].legend()
+    else:
+        ax[2].axis("off")
+
+    plt.tight_layout(); plt.show()
+
+
+# =============================================================================
+# J2) SUBSTATION TRACE (|V| AND θ)                                       [CHANGE]
+# =============================================================================
+def run_single_sim_trace(sim_id: int, df: pd.DataFrame, base_net, pmu_buses: list[int], main_sub: list[int],
+                         input_indexers, rng: np.random.Generator, trace_bus: int):
+    """
+    Re-run one scenario and capture time series at one specific bus (assumed PMU).
+    Returns: df_trace, attack_windows
+    """
+    net = base_net.deepcopy()
+    NB = net.bus.shape[0]
+    slack_bus = int(net.ext_grid.bus.iloc[0]) if len(net.ext_grid) else 0
+
+    dim_x = (NB - 1) + NB
+    points = MerweScaledSigmaPoints(n=dim_x, alpha=ALPHA, beta=BETA, kappa=KAPPA)
+
+    pmu_idx = [int(b) for b in pmu_buses]
+    def hx(x):
+        th, vm = state_unpack(x, NB, slack_bus)
+        return np.concatenate([th[pmu_idx], vm[pmu_idx]])
+    nθ = len(pmu_idx); nV = len(pmu_idx); dim_z = nθ + nV
+
+    R = np.zeros((dim_z, dim_z))
+    sigma_ang_rad = np.deg2rad(PMU_SIGMA_VANG_DEG)
+    for k in range(nθ): R[k,k] = sigma_ang_rad**2
+    for k in range(nθ, nθ+nV): R[k,k] = PMU_SIGMA_VMAG_PU**2
+    R += 1e-10*np.eye(dim_z)
+
+    Qx = np.eye(dim_x)
+    for i in range(NB-1): Qx[i,i] = Q_ANGLE_RAD**2
+    for j in range(NB):   Qx[(NB-1)+j,(NB-1)+j] = Q_VMAG_PU**2
+
+    P0 = np.eye(dim_x)
+    for i in range(NB-1): P0[i,i] = P0_ANGLE_RAD**2
+    for j in range(NB):   P0[(NB-1)+j,(NB-1)+j] = P0_VMAG_PU**2
+    P0 = nearest_spd(P0 + 1e-9*np.eye(dim_x), 1e-9)
+
+    G_t = np.zeros((dim_x, 1), dtype=float)
+    current_du = None
+    def fx_sens(x, dt):
+        x2 = x if current_du is None else (x + G_t.dot(current_du))
+        return clip_and_wrap_state(x2.copy(), NB, slack_bus)
+
+    ukf = UKF(dim_x=dim_x, dim_z=dim_z, fx=fx_sens, hx=hx, dt=DT, points=points)
+    ukf.x = clip_and_wrap_state(state_pack_from_pf(
+        net.res_bus.vm_pu.values.astype(float),
+        net.res_bus.va_degree.values.astype(float),
+        NB, slack_bus), NB, slack_bus)
+    ukf.P, ukf.Q, ukf.R = P0.copy(), Qx.copy(), R.copy()
+    angle_state_idx = np.arange(NB-1, dtype=int)
+    ukf.x_mean_fn = state_mean_fn_factory(angle_state_idx)
+    ukf.residual_x = residual_fn_factory(angle_state_idx)
+    ukf.residual_z = residual_fn_factory(np.arange(nθ, dtype=int))
+
+    # attack window (jitter)
+    base_a, base_b = ATTACK_WINDOW_BASE
+    jitter = int(rng.integers(-5, 6))
+    a = max(10, base_a + jitter)
+    b = min(MAX_SECONDS - 1, a + (base_b - base_a) + 5)
+    attack_windows = [(a, b)]
+
+    u_prev = None
+    prev_loads, prev_gensP, prev_vset, prev_slackV = capture_current_inputs(net)
+    rows = []
+
+    for _, row in df.iterrows():
+        t = int(row["time_s"])
+
+        # Targets/Apply/PF
+        target_loads = {b:(0.0,0.0) for b in range(NB)}
+        for cP, cQ in zip([c for c in df.columns if c.startswith("P_MW_bus")],
+                          [c for c in df.columns if c.startswith("Q_MVAr_bus")]):
+            b = int(cP.split("bus")[-1])
+            target_loads[b] = (float(row[cP]), float(row[cQ]))
+        target_gensP = {b:prev_gensP[b] for b in range(NB)}
+        for cg in [c for c in df.columns if c.startswith("Pgen_MW_bus")]:
+            b = int(cg.split("bus")[-1]); target_gensP[b] = float(row[cg])
+        target_vset  = {b:np.nan for b in range(NB)}
+        for cv in [c for c in df.columns if c.startswith("Vset_pu_bus")]:
+            b = int(cv.split("bus")[-1]); target_vset[b] = float(np.clip(row[cv], VSET_MIN, VSET_MAX))
+        target_slackV = float(np.clip(row["Vset_pu_slack"], VSET_MIN, VSET_MAX)) if "Vset_pu_slack" in df.columns else np.nan
+
+        applied_loads, applied_gensP, applied_vset, applied_slackV, ok = robust_apply_and_solve(
+            net, target_loads, target_gensP, target_vset, target_slackV,
+            prev_loads, prev_gensP, prev_vset, prev_slackV
+        )
+        if ok:
+            prev_loads, prev_gensP, prev_vset, prev_slackV = applied_loads, applied_gensP, applied_vset, applied_slackV
+
+        # G
+        G_t = build_G(net, input_indexers, Sbase=net.sn_mva)
+
+        # du
+        name2val = {}
+        for c in [c for c in df.columns if c.startswith("P_MW_bus")]:
+            b = int(c.split("bus")[-1]); name2val[c] = applied_loads[b][0]
+        for c in [c for c in df.columns if c.startswith("Q_MVAr_bus")]:
+            b = int(c.split("bus")[-1]); name2val[c] = applied_loads[b][1]
+        for c in [c for c in df.columns if c.startswith("Pgen_MW_bus")]:
+            b = int(c.split("bus")[-1]); name2val[c] = applied_gensP[b]
+        for c in [c for c in df.columns if c.startswith("Vset_pu_bus")]:
+            b = int(c.split("bus")[-1]); name2val[c] = applied_vset[b] if not np.isnan(applied_vset[b]) else np.nan
+        if "Vset_pu_slack" in df.columns: name2val["Vset_pu_slack"] = applied_slackV
+        u_t = np.zeros(len(input_indexers), dtype=float)
+        for j,(name,_,_) in enumerate(input_indexers):
+            u_t[j] = 0.0 if np.isnan(name2val.get(name, np.nan)) else float(name2val[name])
+        du_t = np.zeros_like(u_t) if u_prev is None else (u_t - u_prev)
+        u_prev = u_t.copy()
+        current_du = du_t.copy()
+
+        # true, meas
+        vm_true = net.res_bus.vm_pu.values.astype(float)
+        th_true = np.deg2rad(net.res_bus.va_degree.values.astype(float))
+        m_vm = vm_true[pmu_idx].copy() + rng.normal(0.0, PMU_SIGMA_VMAG_PU, size=len(pmu_idx))
+        m_th = wrap_angle(th_true[pmu_idx] + rng.normal(0.0, np.deg2rad(PMU_SIGMA_VANG_DEG), size=len(pmu_idx)))
+
+        # FDIA on main substation
+        in_win, aa, bb = in_any_attack_window(t, attack_windows)
+        if in_win:
+            win_len = max(1, bb - aa); frac = (t - aa + 1) / win_len
+            drift_rad = np.deg2rad(ANGLE_SHIFT_DEG_FINAL * frac)
+            sub_mask = np.isin(pmu_idx, main_sub)
+            m_th[sub_mask] = wrap_angle(m_th[sub_mask] + drift_rad)
+            m_vm[sub_mask] = m_vm[sub_mask] * V_SCALE
+
+        z_t = np.concatenate([m_th, m_vm])
+
+        # UKF
+        ukf.P = nearest_spd(ukf.P, 1e-9); ukf.predict()
+        ukf.x = clip_and_wrap_state(ukf.x, NB, slack_bus)
+        ukf.P = nearest_spd(ukf.P, 1e-9); ukf.update(z_t)
+        ukf.x = clip_and_wrap_state(ukf.x, NB, slack_bus)
+        ukf.P = nearest_spd(ukf.P, 1e-9)
+
+        # unpack for trace bus
+        th_est, vm_est = state_unpack(ukf.x, NB, slack_bus)
+        rec = dict(
+            t=t,
+            V_true=vm_true[trace_bus],
+            V_meas=m_vm[pmu_idx.index(trace_bus)] if trace_bus in pmu_idx else np.nan,
+            V_ukf=vm_est[trace_bus],
+            th_true_deg=np.rad2deg(th_true[trace_bus]),
+            th_meas_deg=np.rad2deg(m_th[pmu_idx.index(trace_bus)]) if trace_bus in pmu_idx else np.nan,
+            th_ukf_deg=np.rad2deg(th_est[trace_bus]),
+            label=int(in_win),
+        )
+        rows.append(rec)
+
+    return pd.DataFrame(rows), attack_windows
+
+def plot_substation_trace(df_trace: pd.DataFrame, wins: list[tuple[int,int]]):
+    t = df_trace["t"].to_numpy()
+    fig, ax = plt.subplots(2, 1, figsize=(12,7), sharex=True)
+
+    # |V|
+    ax[0].plot(t, df_trace["V_true"], lw=2, label="True |V|")
+    ax[0].plot(t, df_trace["V_meas"], ".", ms=3, label="PMU |V| (meas)")
+    ax[0].plot(t, df_trace["V_ukf"], "--", lw=1.8, label="UKF |V|")
+    for i,(a,b) in enumerate(wins): ax[0].axvspan(a,b, alpha=0.18, label="attack window" if i==0 else None)
+    ax[0].set_title("Voltage Magnitude at Bus (Substation)")
+    ax[0].set_ylabel("V (p.u.)"); ax[0].grid(True, alpha=0.3); ax[0].legend()
+
+    # θ
+    ax[1].plot(t, df_trace["th_true_deg"], lw=2, label="True θ")
+    ax[1].plot(t, df_trace["th_meas_deg"], ".", ms=3, label="PMU θ (meas)")
+    ax[1].plot(t, df_trace["th_ukf_deg"], "--", lw=1.8, label="UKF θ")
+    for i,(a,b) in enumerate(wins): ax[1].axvspan(a,b, alpha=0.18, label="attack window" if i==0 else None)
+    ax[1].set_xlabel("Time step")
+    ax[1].set_ylabel("Angle (deg)"); ax[1].grid(True, alpha=0.3); ax[1].legend()
+
+    plt.tight_layout(); plt.show()
+
+
+# =============================================================================
+# K) __main__ — WIRE EVERYTHING TOGETHER
+# =============================================================================
+if __name__ == "__main__":
+    np.random.seed(BASE_SEED)
+    rng = np.random.default_rng(BASE_SEED)
+
+    # 1) Load CSV + Grid
+    df, load_p_cols, load_q_cols, gen_p_cols, vset_cols, has_slack = validate_and_load_csv(CSV_PATH, MAX_SECONDS)
+    base_net = load_cgmes(BOUNDARY_ZIP, BASECASE_ZIP)
+    pmu_buses, main_sub = choose_pmu_buses(base_net)
+    print(f"[INIT] PMU buses: {pmu_buses[:10]}{'...' if len(pmu_buses)>10 else ''}")
+    print(f"[INIT] Target substation buses: {main_sub}")
+
+    # 2) Input indexers
+    slack_bus0 = int(base_net.ext_grid.bus.iloc[0]) if len(base_net.ext_grid) else 0
+    input_indexers = build_input_indexers(load_p_cols, load_q_cols, gen_p_cols, vset_cols, has_slack, slack_bus0)
+
+    # 3) Multi-sim dataset
+    all_df = []
+    for s in range(N_SIMS):
+        sim_rng = np.random.default_rng(BASE_SEED + s)
+        dfi = run_single_sim(s, df, base_net, pmu_buses, main_sub, input_indexers, sim_rng)
+        all_df.append(dfi)
+    df_all = pd.concat(all_df, axis=0, ignore_index=True)
+    print(f"[DATA] Combined dataset: {len(df_all)} rows from {N_SIMS} simulations")
+
+    # 4) Isolation Forest
+    if_model, if_thr, df_all = train_isolation_forest(df_all)
+
+    # 5) HGB
+    hgb_model, hgb_thr, df_all = train_histgb_classifier(df_all)
+
+    # 6) Pretty panels for last sim
+    plot_panels(df_all, sid=N_SIMS-1, if_thr=if_thr, hgb_thr=hgb_thr)
+
+    # 7) Substation trace (pick first bus in main substation)
+    try:
+        trace_bus = main_sub[0] if len(main_sub) else (pmu_buses[0] if len(pmu_buses) else None)
+        if trace_bus is None:
+            raise RuntimeError("No PMU bus available to trace.")
+        sim_rng = np.random.default_rng(BASE_SEED + 777)
+        df_trace, wins = run_single_sim_trace(
+            sim_id=N_SIMS, df=df, base_net=base_net,
+            pmu_buses=pmu_buses, main_sub=main_sub,
+            input_indexers=input_indexers, rng=sim_rng,
+            trace_bus=trace_bus,
+        )
+        plot_substation_trace(df_trace, wins)
+    except Exception as e:
+        print(f"[TRACE] Could not generate substation trace: {e}")
+
+    # 8) Save
+    df_all.to_csv("fdia_ukf_iforest_hgb_timeseries.csv", index=False)
+    print("[SAVED] fdia_ukf_iforest_hgb_timeseries.csv")
