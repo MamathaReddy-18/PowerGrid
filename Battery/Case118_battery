@@ -1,0 +1,490 @@
+import pypsa
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from pypower import case118
+from tqdm import tqdm
+from scipy import stats
+import warnings
+from matplotlib.ticker import FuncFormatter
+import seaborn as sns
+
+# Configure plotting style for research papers
+#plt.style.use('seaborn')
+plt.rcParams['figure.figsize'] = (10, 8)
+plt.rcParams['font.size'] = 12
+plt.rcParams['font.family'] = 'Times New Roman'
+plt.rcParams['axes.grid'] = True
+plt.rcParams['axes.labelsize'] = 14
+plt.rcParams['axes.titlesize'] = 16
+plt.rcParams['legend.fontsize'] = 12
+
+# Define statistical distributions for load and wind generation
+def setup_distributions():
+    """Configure statistical distributions for load and wind generation"""
+    # Truncated normal for load demand with tighter bounds
+    load_params = {
+        'mu': [200, 180, 220],  # Mean load for each zone
+        'std': [20, 18, 22],    # Reduced standard deviation for smoother profiles
+        'min': [100, 90, 110],  # Higher minimum load
+    }
+    
+    # Weibull for wind speed (converted to power via power curve)
+    wind_params = {
+        'shape': [2.0, 2.1, 1.9],  # Shape parameter
+        'scale': [7.0, 7.2, 6.8],  # Scale parameter
+        'loc': [0, 0, 0],          # Location parameter
+        'min': [0, 0, 0],          # Minimum wind speed
+        'max': [25, 25, 25]        # Maximum wind speed
+    }
+    
+    return load_params, wind_params
+
+def wind_power_curve(wind_speed, rated_power=1200, cut_in=3.5, rated_speed=15):
+    """Convert wind speed to power output using a power curve"""
+    power = np.zeros_like(wind_speed)
+    
+    # Linear region between cut-in and rated speed
+    mask = (wind_speed >= cut_in) & (wind_speed < rated_speed)
+    power[mask] = rated_power * ((wind_speed[mask] - cut_in) / (rated_speed - cut_in))**3
+    
+    # Rated power region
+    mask = wind_speed >= rated_speed
+    power[mask] = rated_power
+    
+    return power
+
+def generate_correlated_samples(n_samples, load_params, wind_params):
+    """Generate correlated random samples for load and wind generation"""
+    # Correlation matrix between zones (load1, load2, load3, wind1, wind2, wind3)
+    corr_matrix = np.array([
+        [1.0, 0.7, 0.6, -0.3, -0.2, -0.1],
+        [0.7, 1.0, 0.5, -0.2, -0.3, -0.2],
+        [0.6, 0.5, 1.0, -0.1, -0.2, -0.3],
+        [-0.3, -0.2, -0.1, 1.0, 0.4, 0.3],
+        [-0.2, -0.3, -0.2, 0.4, 1.0, 0.5],
+        [-0.1, -0.2, -0.3, 0.3, 0.5, 1.0]
+    ])
+    
+    # Generate multivariate normal samples
+    mv_normal = stats.multivariate_normal(mean=np.zeros(6), cov=corr_matrix)
+    samples = mv_normal.rvs(n_samples)
+    
+    # Transform to uniform distribution using CDF
+    uniform_samples = stats.norm.cdf(samples)
+    
+    # Transform to target distributions
+    load_wind_samples = np.zeros((n_samples, 6))
+    
+    # Load samples (truncated normal with tighter bounds)
+    for i in range(3):
+        a = (load_params['min'][i] - load_params['mu'][i]) / load_params['std'][i]
+        b = np.inf  # Only left truncation
+        dist = stats.truncnorm(a, b, loc=load_params['mu'][i], scale=load_params['std'][i])
+        load_wind_samples[:, i] = dist.ppf(uniform_samples[:, i])
+    
+    # Wind samples (Weibull converted to power)
+    for i in range(3):
+        a = (wind_params['min'][i] - wind_params['loc'][i]) / wind_params['scale'][i]
+        b = (wind_params['max'][i] - wind_params['loc'][i]) / wind_params['scale'][i]
+        dist = stats.truncnorm(a, b, loc=wind_params['loc'][i], scale=wind_params['scale'][i])
+        wind_speed = dist.ppf(uniform_samples[:, i+3])
+        load_wind_samples[:, i+3] = wind_power_curve(wind_speed)
+    
+    return load_wind_samples
+
+def plot_input_distributions(load_params, wind_params, load_wind_samples):
+    """Plot the input distributions and generated samples"""
+    fig, axes = plt.subplots(2, 2, figsize=(14, 12))
+    
+    # Plot load distributions
+    ax = axes[0, 0]
+    for i in range(3):
+        a = (load_params['min'][i] - load_params['mu'][i]) / load_params['std'][i]
+        b = np.inf
+        dist = stats.truncnorm(a, b, loc=load_params['mu'][i], scale=load_params['std'][i])
+        x = np.linspace(dist.ppf(0.01), dist.ppf(0.99), 100)
+        ax.plot(x, dist.pdf(x), label=f'Zone {i+1}')
+    ax.set_title('Load Demand Probability Distributions')
+    ax.set_xlabel('Load (MW)')
+    ax.set_ylabel('Probability Density')
+    ax.legend()
+    
+    # Plot wind power distributions
+    ax = axes[0, 1]
+    for i in range(3):
+        wind_speeds = np.linspace(wind_params['min'][i], wind_params['max'][i], 100)
+        powers = wind_power_curve(wind_speeds)
+        ax.plot(powers, label=f'Zone {i+1}')
+    ax.set_title('Wind Power Curve')
+    ax.set_xlabel('Wind Speed (m/s)')
+    ax.set_ylabel('Power Output (MW)')
+    ax.legend()
+    
+    # Boxplot of generated load samples
+    ax = axes[1, 0]
+    load_data = pd.DataFrame(load_wind_samples[:, :3], columns=['Zone 1', 'Zone 2', 'Zone 3'])
+    sns.boxplot(data=load_data, ax=ax)
+    ax.set_title('Generated Load Samples Distribution')
+    ax.set_ylabel('Load (MW)')
+    
+    # Boxplot of generated wind samples
+    ax = axes[1, 1]
+    wind_data = pd.DataFrame(load_wind_samples[:, 3:], columns=['Zone 1', 'Zone 2', 'Zone 3'])
+    sns.boxplot(data=wind_data, ax=ax)
+    ax.set_title('Generated Wind Power Samples Distribution')
+    ax.set_ylabel('Wind Power (MW)')
+    
+    plt.tight_layout()
+    plt.show()
+
+def create_daily_profile(base, amplitude, peak_hour, noise_scale=0.1, profile_type="load"):
+    """Create realistic daily profiles with smoother variations"""
+    hours = np.arange(24)
+    
+    if profile_type == "load":
+        # Double peak for load (morning and evening) with smoother transitions
+        morning_peak = 0.5 * amplitude * np.cos(np.pi*(hours - peak_hour)/6)
+        evening_peak = 0.5 * amplitude * np.cos(np.pi*(hours - (peak_hour-6))/8)
+        pattern = base + morning_peak + evening_peak
+    else:
+        # Wind pattern with smoother variations
+        pattern = base + amplitude * np.sin(np.pi*(hours - peak_hour)/12)
+    
+    # Add correlated noise with reduced amplitude
+    noise = noise_scale * base * np.random.normal(0, 0.5, 24)
+    
+    # Ensure positive values with tighter bounds
+    return np.clip(pattern + noise, 0.7*base, 1.3*base)
+
+def is_result_valid(result):
+    """Check if the optimization result is valid and feasible"""
+    if result is None or result["status"] != "optimal":
+        return False
+    
+    # Check for unrealistic values
+    if (result["total_load"].min() < 0 or 
+        result["total_wind"].min() < -1e-3 or 
+        result["total_thermal"].min() < -1e-3 or
+        result["soc"].min() < -1e-3):
+        return False
+    
+    # Check for NaN values
+    if (np.isnan(result["total_load"]).any() or np.isnan(result["total_wind"])).any():
+        return False
+    
+    return True
+
+def run_simulation(sample_id, load_wind_sample):
+    """Run a single simulation with correlated parameters"""
+    np.random.seed(sample_id)  # For reproducible randomness
+    
+    try:
+        # Initialize network
+        network = pypsa.Network()
+        network.set_snapshots(range(24))
+        
+        # Load IEEE 118-bus case data
+        ppc = case118.case118()
+        bus_numbers = [int(bus[0]) for bus in ppc['bus']]
+        
+        # Battery configuration
+        battery_config = [
+            {"name": f"Battery_Zone1_{sample_id}", "bus": 10, "capacity": 2500*(0.8 + 0.4*np.random.rand()), 
+             "power": 500*(0.7 + 0.6*np.random.rand())},
+            {"name": f"Battery_Zone2_{sample_id}", "bus": 49, "capacity": 3500*(0.8 + 0.4*np.random.rand()), 
+             "power": 700*(0.7 + 0.6*np.random.rand())},
+            {"name": f"Battery_Zone3_{sample_id}", "bus": 80, "capacity": 3000*(0.8 + 0.4*np.random.rand()), 
+             "power": 600*(0.7 + 0.6*np.random.rand())},
+        ]
+        
+        # Add carriers
+        for carrier in ["AC", "wind", "thermal", "battery"]:
+            network.add("Carrier", carrier)
+        
+        # Add buses
+        for bus in ppc['bus']:
+            network.add("Bus", name=f"Bus {int(bus[0])}", v_nom=bus[9], carrier="AC")
+        
+        # Zone configuration with smoother profiles
+        zones = {
+            "Zone1": {
+                "load": create_daily_profile(load_wind_sample[0], 60, 18, 0.1, "load"),
+                "wind": create_daily_profile(load_wind_sample[3], 100, 3, 0.2, "wind"),
+                "buses": [b for b in [1,2,11,12,113,114,115,117,13,14,15,16,17,18,19,20,3,21,22,23,25,26,27,28,29,30,4,31,32,5,6,7,8,9,10] if b in bus_numbers]
+            },
+            "Zone2": {
+                "load": create_daily_profile(load_wind_sample[1], 50, 17, 0.1, "load"),
+                "wind": create_daily_profile(load_wind_sample[4], 80, 2, 0.2, "wind"),
+                "buses": [b for b in [24,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,66,67,68,69,70,71,72,73,74,75,76] if b in bus_numbers]
+            },
+            "Zone3": {
+                "load": create_daily_profile(load_wind_sample[2], 70, 19, 0.1, "load"),
+                "wind": create_daily_profile(load_wind_sample[5], 120, 4, 0.2, "wind"),
+                "buses": [b for b in [77,78,79,80,81,82,83,84,85,86,87,88,89,90,91,92,93,94,95,96,97,98,99,100,101,102,103,104,105,106,107,108,109,110,111,112] if b in bus_numbers]
+            }
+        }
+        
+        # Load distribution with smoother variations
+        for zone, params in zones.items():
+            for i, bus in enumerate(params["buses"][:15]):  # Distribute across more buses
+                load_variation = 0.8 + 0.4*i/14  # Smoother load distribution
+                network.add("Load", 
+                          name=f"Load_{zone}_{bus}_{sample_id}",
+                          bus=f"Bus {bus}", 
+                          p_set=params["load"] * load_variation)
+        
+        # Wind generation
+        for zone, params in zones.items():
+            if params["buses"]:
+                p_nom = 1200 * (0.7 + 0.6*np.random.rand())  # MW
+                for i, bus in enumerate(params["buses"][:3]):  # 3 wind farms per zone
+                    farm_p_nom = p_nom * (0.5 + 0.5*np.random.rand())
+                    network.add("Generator",
+                              name=f"Wind_{zone}_{i}_{sample_id}",
+                              bus=f"Bus {bus}",
+                              p_nom=farm_p_nom,
+                              carrier="wind",
+                              marginal_cost=0,
+                              p_max_pu=params["wind"]/farm_p_nom * (0.8 + 0.4*np.random.rand()))
+        
+        # Thermal generators
+        for i, gen in enumerate(ppc['gen']):
+            bus_id = int(gen[0])
+            cost = 80*(0.7 + 0.6*np.random.rand()) + i*2.0
+            p_min = 0.2 + 0.3*np.random.rand() if gen[9] > 0 else 0
+            
+            network.add("Generator",
+                       name=f"Gen_{i}_{sample_id}",
+                       bus=f"Bus {bus_id}",
+                       p_nom=gen[8] if gen[8] > 0 else 150*(0.8 + 0.4*np.random.rand()),
+                       p_min_pu=p_min,
+                       marginal_cost=cost,
+                       ramp_limit_up=0.3*(0.7 + 0.6*np.random.rand()),
+                       ramp_limit_down=0.3*(0.7 + 0.6*np.random.rand()),
+                       carrier="thermal")
+        
+        # Transmission lines
+        for i, branch in enumerate(ppc['branch']):
+            from_bus = int(branch[0])
+            to_bus = int(branch[1])
+            s_nom = branch[5] if branch[5] > 0 else 150*(0.7 + 0.6*np.random.rand())
+            network.add("Line",
+                       name=f"Line_{i}_{sample_id}",
+                       bus0=f"Bus {from_bus}",
+                       bus1=f"Bus {to_bus}",
+                       r=max(branch[2], 0.0001)*(0.8 + 0.4*np.random.rand()),
+                       x=max(branch[3], 0.01)*(0.8 + 0.4*np.random.rand()),
+                       s_nom=s_nom,
+                       s_max_pu=1.0)
+        
+        # Battery storage
+        for battery in battery_config:
+            network.add("StorageUnit",
+                       name=battery["name"],
+                       bus=f"Bus {battery['bus']}",
+                       p_nom=battery["power"],
+                       max_hours=battery["capacity"]/battery["power"],
+                       efficiency_store=0.85 + 0.1*np.random.rand(),
+                       efficiency_dispatch=0.85 + 0.1*np.random.rand(),
+                       marginal_cost=3 + 4*np.random.rand(),
+                       cyclic_state_of_charge=True,
+                       state_of_charge_initial=(0.2 + 0.6*np.random.rand())*battery["capacity"],
+                       state_of_charge_period=24)
+        
+        # Run optimization
+        network.optimize()
+        
+        # Collect results
+        results = {
+            "sample_id": sample_id,
+            "status": "optimal",
+            "total_load": network.loads_t.p.sum(axis=1).values,
+            "total_wind": network.generators_t.p.filter(like='Wind').sum(axis=1).values,
+            "total_thermal": network.generators_t.p.filter(like='Gen').sum(axis=1).values,
+            "total_battery": network.storage_units_t.p.sum(axis=1).values,
+            "soc": network.storage_units_t.state_of_charge.sum(axis=1).values,
+            "losses": network.lines_t.p0.abs().sum(axis=1).values * 0.02,
+            "load_sample": load_wind_sample[:3],
+            "wind_sample": load_wind_sample[3:],
+            "wind_penetration": network.generators_t.p.filter(like='Wind').sum().sum() / 
+                               network.loads_t.p.sum().sum() * 100,
+            "total_cost": network.objective  # Capture the total system cost
+        }
+        
+        return results
+    
+    except Exception as e:
+        warnings.warn(f"Optimization failed for sample {sample_id}: {str(e)}")
+        return None
+
+def plot_optimization_results(all_results):
+    """Plot histograms of optimization results and costs"""
+    # Filter only valid results
+    valid_results = [r for r in all_results if is_result_valid(r)]
+    
+    if not valid_results:
+        print("No valid results to plot")
+        return
+    
+    # Create DataFrame of results
+    df_results = pd.DataFrame({
+        'sample_id': [r['sample_id'] for r in valid_results],
+        'wind_penetration': [r['wind_penetration'] for r in valid_results],
+        'total_cost': [r['total_cost'] for r in valid_results]
+    })
+    
+    # Plot histograms
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+    
+    # Wind penetration histogram
+    ax = axes[0]
+    sns.histplot(df_results['wind_penetration'], bins=20, kde=True, ax=ax)
+    ax.set_title('Wind Penetration Distribution')
+    ax.set_xlabel('Wind Penetration (%)')
+    ax.set_ylabel('Frequency')
+    
+    # Total cost histogram
+    ax = axes[1]
+    sns.histplot(df_results['total_cost'], bins=20, kde=True, ax=ax)
+    ax.set_title('Total System Cost Distribution')
+    ax.set_xlabel('Total Cost')
+    ax.set_ylabel('Frequency')
+    
+    plt.tight_layout()
+    plt.show()
+
+def main():
+    """Main execution function with improved analysis"""
+    # Setup statistical distributions
+    load_params, wind_params = setup_distributions()
+    
+    # Run Monte Carlo simulation
+    n_samples = 1000
+    all_results = []
+    
+    # Generate correlated samples first
+    load_wind_samples = generate_correlated_samples(n_samples, load_params, wind_params)
+    
+    # Plot input distributions
+    plot_input_distributions(load_params, wind_params, load_wind_samples)
+    
+    for sample_id in tqdm(range(n_samples), desc="Running simulations"):
+        result = run_simulation(sample_id, load_wind_samples[sample_id])
+        if result is not None:
+            all_results.append(result)
+
+    successful_samples = len([r for r in all_results if is_result_valid(r)])
+    print(f"\nSuccessfully completed {successful_samples} out of {n_samples} samples ({successful_samples/n_samples*100:.1f}%)")
+    
+    if successful_samples == 0:
+        raise RuntimeError("No valid simulations completed. Check your parameters and constraints.")
+    
+    # Plot optimization results
+    plot_optimization_results(all_results)
+    
+    # Process only valid results into DataFrames
+    valid_results = [r for r in all_results if is_result_valid(r)]
+    
+    df_hourly = pd.concat([pd.DataFrame({
+        "hour": range(24),
+        "sample_id": r["sample_id"],
+        "load": r["total_load"],
+        "wind": r["total_wind"],
+        "thermal": r["total_thermal"],
+        "battery": r["total_battery"],
+        "losses": r["losses"],
+        "soc": r["soc"],
+        "wind_penetration": r["wind_penetration"],
+        "total_cost": r["total_cost"]
+    }) for r in valid_results])
+
+    # Statistical aggregation
+    def q_low(x): return np.percentile(x, 5)
+    def q_high(x): return np.percentile(x, 95)
+    
+    df_summary = df_hourly.groupby("hour").agg({
+        "load": ["mean", "std", q_low, q_high],
+        "wind": ["mean", "std", q_low, q_high],
+        "thermal": ["mean", "std", q_low, q_high],
+        "battery": ["mean", "std", q_low, q_high],
+        "losses": ["mean", "std"],
+        "soc": ["mean", "std"]
+    })
+
+    # Create visualizations
+    fig, axes = plt.subplots(2, 1, figsize=(12, 12))
+    
+    # Formatting function for y-axis
+    def mw_formatter(x, pos): return f"{x:.0f} MW"
+    
+    # 1. Power balance with confidence intervals
+    ax = axes[0]
+    ax.plot(df_summary["load"]["mean"], label='Load (mean)', color='#d62728', linewidth=2)
+    ax.fill_between(range(24), 
+                   df_summary["load"]["q_low"], 
+                   df_summary["load"]["q_high"], 
+                   color='#d62728', alpha=0.2, label='Load (90% CI)')
+    
+    ax.plot(df_summary["wind"]["mean"], label='Wind (mean)', color='#2ca02c', linewidth=2)
+    ax.fill_between(range(24), 
+                   df_summary["wind"]["q_low"], 
+                   df_summary["wind"]["q_high"], 
+                   color='#2ca02c', alpha=0.2, label='Wind (90% CI)')
+    
+    ax.plot(df_summary["thermal"]["mean"], label='Thermal (mean)', color='#1f77b4', linewidth=2)
+    ax.fill_between(range(24), 
+                   df_summary["thermal"]["q_low"], 
+                   df_summary["thermal"]["q_high"], 
+                   color='#1f77b4', alpha=0.2, label='Thermal (90% CI)')
+    
+    ax.plot(df_summary["battery"]["mean"], label='Battery (mean)', color='#9467bd', linewidth=2)
+    ax.fill_between(range(24), 
+                   df_summary["battery"]["q_low"], 
+                   df_summary["battery"]["q_high"], 
+                   color='#9467bd', alpha=0.2, label='Battery (90% CI)')
+    
+    ax.set_title('Power Balance Statistics Across Samples', fontsize=16)
+    ax.set_ylabel('Power', fontsize=14)
+    ax.yaxis.set_major_formatter(FuncFormatter(mw_formatter))
+    ax.legend(fontsize=12, bbox_to_anchor=(1.05, 1))
+    ax.grid(True, alpha=0.3)
+    
+    # 2. Battery state of charge
+    ax = axes[1]
+    mean_soc = df_summary["soc"]["mean"]
+    std_soc = df_summary["soc"]["std"]
+    
+    ax.plot(mean_soc, label='Mean State of Charge', color='#17becf', linewidth=2)
+    ax.fill_between(range(24), 
+                   mean_soc - std_soc, 
+                   mean_soc + std_soc, 
+                   color='#17becf', alpha=0.2, label='Â±1 Std Dev')
+    
+    ax.set_title('Battery Storage State of Charge Statistics', fontsize=16)
+    ax.set_ylabel('Energy', fontsize=14)
+    ax.yaxis.set_major_formatter(FuncFormatter(mw_formatter))
+    ax.legend(fontsize=12)
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.show()
+    
+    # Print key statistics
+    print("\nKey Statistics Across Valid Samples:")
+    print(f"- Average peak load: {df_summary['load']['mean'].max():.1f} MW")
+    print(f"- Average wind penetration: {df_hourly['wind_penetration'].mean():.1f}%")
+    print(f"- Battery utilization: {df_summary['battery']['mean'].max():.1f} MW max discharge")
+    print(f"- Thermal generation share: {df_summary['thermal']['mean'].sum()/df_summary['load']['mean'].sum()*100:.1f}%")
+    print(f"- Average total cost: {df_hourly['total_cost'].mean():.2f}")
+
+    # Save only valid results for further analysis
+    df_hourly.to_csv("monte_carlo_results_hourly.csv", index=False)
+    pd.DataFrame({
+        'sample_id': [r['sample_id'] for r in valid_results],
+        'wind_penetration': [r['wind_penetration'] for r in valid_results],
+        'total_cost': [r['total_cost'] for r in valid_results]
+    }).to_csv("monte_carlo_summary.csv", index=False)
+
+if __name__ == "__main__":
+    main()
